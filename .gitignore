@@ -1,0 +1,9 @@
+.pio/
+.vscode/
+*.bin
+*.elf
+platformio_override.ini
+
+# python cache (custom test runner)
+__pycache__/
+*.pyc
