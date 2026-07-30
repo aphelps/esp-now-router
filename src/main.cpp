@@ -7,8 +7,9 @@
 // Wire format + RX ring are the SAME headers the WLED edges use (included from the sibling WLED
 // submodule via the -I in platformio.ini) so the format cannot drift.
 //
-// This file: the relay data path, beacon-based leader election, and neighbor table. HTTP OTA is
-// in ota.{h,cpp}. The elected leader owns the shared timebase reference.
+// This file: the relay data path, beacon-based leader election, and neighbor table. The attach
+// protocol (router advertisements, node membership, upstream selection) is in attach.{h,cpp} and
+// HTTP OTA is in ota.{h,cpp}. The elected leader owns the shared timebase reference.
 //
 #include <Arduino.h>
 #include <WiFi.h>
@@ -22,6 +23,7 @@
 #include "sensor_sync_ring.h"       // SpscByteRing (lock-free SPSC, same as the edge RX ring)
 #include "router_relay.h"           // router logic: ss_router_should_relay, SensorRouterPeer, RouterBeacon
 #include "router_election.h"        // pure leader-election state machine (host-tested)
+#include "attach.h"                 // attach protocol: router advertisements, membership, failover
 #include "ota.h"                    // WiFi bring-up + POST /update route (server owned here)
 
 #ifndef ROUTER_ESPNOW_CHANNEL
@@ -51,6 +53,7 @@ static WebServer httpServer(80);   // top-level HTTP server; ota.cpp registers /
 static uint32_t rxFrames    = 0;   // our frames received
 static uint32_t relayFrames = 0;   // frames re-broadcast
 static uint32_t beaconFrames = 0;  // beacons received
+static uint32_t controlFrames = 0; // attach-protocol frames received (advert / attach / ack)
 
 // Neighbor (peer-router) table — populated by beacons.
 struct RouterNeighbor { uint32_t deviceId; uint32_t lastSeenMs; bool used; };
@@ -101,14 +104,7 @@ static void sweepNeighbors(uint32_t now) {
 static void sendBeacon(uint32_t now) {
   uint8_t buf[sizeof(SensorSyncHeader) + sizeof(RouterBeacon)];
   SensorSyncHeader h{};
-  h.magic[0] = 'A'; h.magic[1] = 'M'; h.magic[2] = 'P'; h.magic[3] = 'S';
-  h.version = SENSOR_SYNC_VERSION;
-  h.msgType = SENSOR_SYNC_MSG_BEACON;
-  h.dataLen = sizeof(RouterBeacon);
-  h.deviceId = selfId;
-  h.seq = beaconSeq++;
-  h.ttl = 1;               // never relayed
-  h.timestamp = now;
+  ra_stamp_control_header(h, selfId, SENSOR_SYNC_MSG_BEACON, sizeof(RouterBeacon), beaconSeq++, now);
   RouterBeacon b{ uptimeSecs(), election.term };
   memcpy(buf, &h, sizeof(h));
   memcpy(buf + sizeof(h), &b, sizeof(b));
@@ -138,13 +134,20 @@ static void handleInfo() {
   j += "\"leaderTimeoutMs\":" + String(ROUTER_LEADER_TIMEOUT_MS) + ",";
   j += "\"maxOrigins\":" + String(ROUTER_MAX_ORIGINS) + ",";
   j += "\"maxNeighbors\":" + String(ROUTER_MAX_NEIGHBORS) + ",";
+  j += "\"advertMs\":" + String(ROUTER_ADVERT_MS) + ",";
+  j += "\"attachMs\":" + String(ROUTER_ATTACH_MS) + ",";
+  j += "\"memberLeaseMs\":" + String(ROUTER_MEMBER_LEASE_MS) + ",";
+  j += "\"routeTimeoutMs\":" + String(ROUTER_ROUTE_TIMEOUT_MS) + ",";
+  j += "\"routeHoldDownMs\":" + String(ROUTER_ROUTE_HOLDDOWN_MS) + ",";
+  j += "\"maxMembers\":" + String(ROUTER_MAX_MEMBERS) + ",";
   j += "\"defaultTtl\":" + String(SS_DEFAULT_TTL);
   j += "}";
   httpServer.send(200, "application/json", j);
 }
 
-// GET /routes — the routing state as JSON: per-origin dedup table (who we relay + last seq) and
-// the peer-router neighbor table (with age).
+// GET /routes — the routing state as JSON: per-origin dedup table (who we relay + last seq), the
+// peer-router neighbor table (with age), the upstream router we are attached to, and the nodes
+// attached to us.
 static void handleRoutes() {
   uint32_t now = millis();
   String j = "{\"origins\":[";
@@ -163,7 +166,9 @@ static void handleRoutes() {
     first = false;
     j += "{\"id\":\"" + String(neighbors[i].deviceId, HEX) + "\",\"ageMs\":" + String(now - neighbors[i].lastSeenMs) + "}";
   }
-  j += "]}";
+  j += "],\"upstream\":" + attachRouteJson();
+  j += ",\"members\":" + attachMembersJson();
+  j += "}";
   httpServer.send(200, "application/json", j);
 }
 
@@ -177,6 +182,8 @@ static void handleDebug() {
   j += "\"rxFrames\":" + String(rxFrames) + ",";
   j += "\"relayFrames\":" + String(relayFrames) + ",";
   j += "\"beaconFrames\":" + String(beaconFrames) + ",";
+  j += "\"controlFrames\":" + String(controlFrames) + ",";
+  j += "\"memberCount\":" + String((unsigned)attachMemberCount()) + ",";
   j += "\"freeHeap\":" + String(ESP.getFreeHeap()) + ",";
   j += "\"staWifiUp\":" + String(otaWifiUp() ? "true" : "false");
   j += "}";
@@ -191,6 +198,7 @@ void setup() {
   // else raises the fallback SoftAP.
   WiFi.mode(WIFI_STA);
   selfId = deriveDeviceId();
+  attachBegin(selfId);
   quickEspNow.onDataRcvd(onEspNowRx);
   quickEspNow.begin(ROUTER_ESPNOW_CHANNEL);
 
@@ -230,6 +238,13 @@ void loop() {
       continue;
     }
 
+    // Attach-protocol frames (advertisement, attach, ack) are consumed by that module; anything
+    // it does not claim falls through to the relay path below.
+    if (attachHandleFrame(h, buf + sizeof(h), n - (int)sizeof(h), now)) {
+      controlFrames++;
+      continue;
+    }
+
     // Backpressure: if the TX queue can't take a frame right now, skip WITHOUT deduping so a
     // re-heard copy (this is a flood — the same frame arrives from multiple neighbors) can still
     // relay it once the queue drains. Deduping-then-dropping would strand this seq forever.
@@ -255,4 +270,9 @@ void loop() {
     re_tick(election, selfId, uptimeSecs(), now, ROUTER_LEADER_TIMEOUT_MS);   // (re)assert leadership
     sendBeacon(now);
   }
+
+  // 3. Attach tick: release members whose lease ran out, drop a silent upstream router, and send
+  //    our advertisement + attach keepalive. Its own intervals gate the sends, so it runs every
+  //    loop and reacts to a lost route without waiting for the slower beacon tick.
+  attachTick(election, now);
 }
