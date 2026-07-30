@@ -6,12 +6,16 @@ Dedicated non-WLED ESP32 nodes that **relay** SensorSync (`AMPS`) frames multi-h
 nodes that can't hear each other directly still receive every event. Loop-free flood via the
 shared, host-tested `ss_router_should_relay()` (per-origin `seq` dedup + TTL). No LEDs, no UI.
 
+Routers also run an **attach protocol**: each advertises its distance to the elected timebase
+leader, nodes bind to the router they rank best, and heartbeat timeouts drop dead routes so the
+mesh re-forms on its own when a router goes away.
+
 ## Layout in the mesh
 
 ```
 edge ──ESP-NOW─┐                             ┌─ESP-NOW── edge
 edge ──ESP-NOW─┤  router ──ESP-NOW── router  ├─ESP-NOW── edge   (this repo = the router tier)
-edge ──ESP-NOW─┘   (relay + leader)          └─ESP-NOW── edge
+edge ──ESP-NOW─┘  (relay + leader + attach)  └─ESP-NOW── edge
 ```
 
 ## Shared wire format
@@ -51,12 +55,12 @@ With **no** infra-WiFi creds set, the router stands up a fallback SoftAP — joi
 
 ## Tests
 
-Host unit tests for the router-used logic (`ss_router_*` relay + leader election) live in `tests/`
-(pure logic, run on your machine — no device). Run from **inside `WLED_dev`** so the sibling `WLED`
-wire header resolves:
+Host unit tests for the router-used logic (`ss_router_*` relay, leader election, attach protocol)
+live in `tests/` (pure logic, run on your machine — no device). Run from **inside `WLED_dev`** so
+the sibling `WLED` wire header resolves:
 
 ```bash
-pio test -e native        # idiomatic — runs both suites on the host
+pio test -e native        # idiomatic — runs every suite on the host
 make -C tests coverage    # gcov line coverage (pio's custom runner doesn't do coverage)
 ```
 
@@ -64,4 +68,5 @@ make -C tests coverage    # gcov line coverage (pio's custom runner doesn't do c
 
 ## Design
 
-`BACKBONE_ROUTER.md` — relay + leader-election design and the fixed-channel go/no-go.
+`BACKBONE_ROUTER.md` — relay, leader-election, attach and failover design, plus the
+fixed-channel go/no-go.

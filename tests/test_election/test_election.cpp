@@ -5,7 +5,8 @@
 //
 // Covers: fresh follower, boot hold-down, promotion to leader (term bump), step-down on a better
 // beacon, best-heard (not latest) tracking, not-better beacons ignored, stale-term rejection,
-// same-leader liveness refresh, and failover (tracked leader goes silent -> reassert).
+// same-leader liveness refresh, failover (tracked leader goes silent -> reassert), and the
+// deviceId tiebreak between equally-lived survivors of a re-election.
 #include "../../src/router_election.h"
 #include <cstdio>
 
@@ -98,6 +99,27 @@ static void test_failover() {
   CHECK(e.isLeader && e.leaderId == SELF && e.term == 2, "self leader again with term 2");
 }
 
+// ---- 7. Re-election tiebreak: two equally-lived survivors settle on the higher deviceId ----
+static void test_reelection_tiebreak() {
+  RouterElection e = re_init();
+  re_on_beacon(e, /*sender*/300, /*uptime*/50, /*term*/1, SELF, /*selfUptime*/7, /*now*/1000);
+  CHECK(e.leaderId == 300, "following the long-lived leader 300");
+
+  // 300 dies. We reassert on our own metric once the timeout passes.
+  CHECK(re_tick(e, SELF, /*uptime*/7, 1000 + TMO + 1, TMO), "reassert when the leader dies");
+  CHECK(e.isLeader && e.leaderId == SELF, "we take over as the leader");
+
+  // The other survivor has exactly our uptime, so only the deviceId separates them. Its id (200)
+  // beats ours (100), so we step back down — and because the rule is a strict total order, that
+  // survivor makes the mirror-image decision and keeps leadership. No thrash, no split brain.
+  re_on_beacon(e, /*sender*/200, /*uptime*/7, /*term*/1, SELF, /*selfUptime*/7, /*now*/5000);
+  CHECK(!e.isLeader && e.leaderId == 200, "equal uptime: the higher deviceId leads");
+
+  // A survivor with the same uptime but a lower id does not unseat that winner.
+  re_on_beacon(e, /*sender*/50, /*uptime*/7, /*term*/1, SELF, /*selfUptime*/7, /*now*/5100);
+  CHECK(e.leaderId == 200, "a lower-id survivor loses the tiebreak");
+}
+
 int main() {
   test_boot_and_promote();
   test_n1();
@@ -105,6 +127,7 @@ int main() {
   test_best_not_latest();
   test_term_and_liveness();
   test_failover();
+  test_reelection_tiebreak();
   if (g_fail) { printf("SOME TESTS FAILED\n"); return 1; }
   printf("ALL TESTS PASSED\n");
   return 0;

@@ -30,9 +30,17 @@ static inline SensorRouterPeer *ss_router_relay_slot(SensorRouterPeer *tbl, uint
   return &tbl[0];
 }
 
+// Does this msgType travel multi-hop? Only sensor snapshots do. Every other type — the election
+// beacon, the router heartbeat, and the attach handshake — is a single-hop control frame consumed
+// by whichever node hears it, so relaying one would leak local control state across the mesh.
+static inline bool ss_router_is_relayable(uint8_t msgType) {
+  return msgType == SENSOR_SYNC_MSG_SNAPSHOT;
+}
+
 // Relay decision for a router. Returns true iff `h` should be re-broadcast, and writes the TTL to
 // stamp on the outgoing copy to *outTtl. `selfId` is this node's deviceId. Rules:
-//   0. Self: never relay a frame we originated (its echo looping back) -> drop. Lets a node that is
+//   0a. Control frames (anything but a snapshot) are single-hop -> drop.
+//   0b. Self: never relay a frame we originated (its echo looping back) -> drop. Lets a node that is
 //      both an edge (originator) and a relay coexist; for a pure router selfId never matches.
 //   1. Dedup: a frame whose seq is not newer than the last seen from this origin is a duplicate
 //      (a loop echo or a reorder) -> drop. Primary loop terminator. First frame from an origin is
@@ -43,6 +51,7 @@ static inline SensorRouterPeer *ss_router_relay_slot(SensorRouterPeer *tbl, uint
 // still suppresses its own later loop echoes.
 static inline bool ss_router_should_relay(const SensorSyncHeader &h, uint32_t selfId,
                                           SensorRouterPeer *tbl, uint8_t maxEntries, uint8_t *outTtl) {
+  if (!ss_router_is_relayable(h.msgType)) return false;             // single-hop control frame
   if (h.deviceId == selfId) return false;                           // never relay our own echo
   SensorRouterPeer *p = ss_router_relay_slot(tbl, maxEntries, h.deviceId);
   if (p->haveSeq && !ss_seq_newer(h.seq, p->lastSeq)) return false;  // duplicate / reorder
