@@ -29,6 +29,74 @@ static SensorSyncHeader mkhdr(uint32_t dev, uint16_t seq, uint8_t ttl) {
   return h;
 }
 
+static SensorSyncHeader mkhdr_type(uint32_t dev, uint16_t seq, uint8_t ttl, uint8_t msgType) {
+  SensorSyncHeader h = mkhdr(dev, seq, ttl);
+  h.msgType = msgType;
+  return h;
+}
+
+// ---- 1b. Which msgTypes cross the backbone ----
+// The predicate is a whitelist, and until M4 it whitelisted snapshots alone. These assertions pin
+// BOTH directions: that control frames now travel, and that the router's own plane still does not.
+// A regression either way is silent in normal operation — a leaked beacon corrupts a distant
+// router's routing metric, and a dropped control frame just looks like flaky WiFi.
+static void test_relayable_types() {
+  CHECK(ss_router_is_relayable(SENSOR_SYNC_MSG_SNAPSHOT),  "snapshots relay");
+  CHECK(ss_router_is_relayable(SENSOR_SYNC_MSG_CONTROL),   "control frames relay");
+
+  CHECK(!ss_router_is_relayable(SENSOR_SYNC_MSG_BEACON),     "election beacon stays single-hop");
+  CHECK(!ss_router_is_relayable(SENSOR_SYNC_MSG_ROUTER_ADV), "router heartbeat stays single-hop");
+  CHECK(!ss_router_is_relayable(SENSOR_SYNC_MSG_ATTACH),     "attach stays single-hop");
+  CHECK(!ss_router_is_relayable(SENSOR_SYNC_MSG_ATTACH_ACK), "attach-ack stays single-hop");
+  // Reserved but deliberately not relayed — see the comment on the predicate.
+  CHECK(!ss_router_is_relayable(SENSOR_SYNC_MSG_TIMEBASE),   "timebase beacon stays single-hop");
+  // An unallocated type must not start travelling just because it exists.
+  CHECK(!ss_router_is_relayable(200), "unknown msgType stays single-hop");
+}
+
+// ---- 1c. Control frames get the same dedup + TTL treatment as snapshots ----
+static void test_control_relay_semantics() {
+  const uint32_t SELF = 0x000000AA, ORIGIN = 0x000000BB;
+  SensorRouterPeer tbl[4] = {};
+  uint8_t ttlOut = 0;
+
+  SensorSyncHeader c1 = mkhdr_type(ORIGIN, 1, SS_DEFAULT_TTL, SENSOR_SYNC_MSG_CONTROL);
+  CHECK(ss_router_should_relay(c1, SELF, tbl, 4, &ttlOut), "fresh control frame relays");
+  CHECK(ttlOut == SS_DEFAULT_TTL - 1, "control TTL is decremented like a snapshot's");
+
+  CHECK(!ss_router_should_relay(c1, SELF, tbl, 4, &ttlOut), "duplicate control frame dropped");
+
+  SensorSyncHeader c2 = mkhdr_type(ORIGIN, 2, SS_DEFAULT_TTL, SENSOR_SYNC_MSG_CONTROL);
+  CHECK(ss_router_should_relay(c2, SELF, tbl, 4, &ttlOut), "newer control frame relays");
+
+  // Exhausted hop budget drops, same as a snapshot.
+  SensorSyncHeader c3 = mkhdr_type(ORIGIN, 3, 1, SENSOR_SYNC_MSG_CONTROL);
+  CHECK(!ss_router_should_relay(c3, SELF, tbl, 4, &ttlOut), "control frame with ttl<=1 dropped");
+
+  // Our own control echo is never relayed.
+  SensorSyncHeader own = mkhdr_type(SELF, 9, SS_DEFAULT_TTL, SENSOR_SYNC_MSG_CONTROL);
+  CHECK(!ss_router_should_relay(own, SELF, tbl, 4, &ttlOut), "own control echo not relayed");
+
+  // Snapshots and control frames from one origin share a single seq space (the edge stamps both
+  // from one txSeq counter), so they must not shadow each other in the dedup table.
+  SensorRouterPeer tbl2[4] = {};
+  SensorSyncHeader s10 = mkhdr_type(ORIGIN, 10, SS_DEFAULT_TTL, SENSOR_SYNC_MSG_SNAPSHOT);
+  SensorSyncHeader c11 = mkhdr_type(ORIGIN, 11, SS_DEFAULT_TTL, SENSOR_SYNC_MSG_CONTROL);
+  SensorSyncHeader s12 = mkhdr_type(ORIGIN, 12, SS_DEFAULT_TTL, SENSOR_SYNC_MSG_SNAPSHOT);
+  CHECK(ss_router_should_relay(s10, SELF, tbl2, 4, &ttlOut), "interleaved: snapshot 10 relays");
+  CHECK(ss_router_should_relay(c11, SELF, tbl2, 4, &ttlOut), "interleaved: control 11 relays");
+  CHECK(ss_router_should_relay(s12, SELF, tbl2, 4, &ttlOut), "interleaved: snapshot 12 relays");
+
+  // A single-hop type must be dropped by should_relay even when everything else says relay, and
+  // must NOT consume dedup state that a later real frame depends on.
+  SensorRouterPeer tbl3[4] = {};
+  SensorSyncHeader beacon = mkhdr_type(ORIGIN, 5, SS_DEFAULT_TTL, SENSOR_SYNC_MSG_BEACON);
+  CHECK(!ss_router_should_relay(beacon, SELF, tbl3, 4, &ttlOut), "beacon dropped by should_relay");
+  SensorSyncHeader ctrl5 = mkhdr_type(ORIGIN, 5, SS_DEFAULT_TTL, SENSOR_SYNC_MSG_CONTROL);
+  CHECK(ss_router_should_relay(ctrl5, SELF, tbl3, 4, &ttlOut),
+        "dropped beacon did not poison dedup state for a later frame");
+}
+
 // ---- 1. Wire compatibility: reserved->ttl/flags is same-size, same-offset ----
 static void test_wire_compat() {
   CHECK(sizeof(SensorSyncHeader) == 20, "header is still 20 bytes");
@@ -230,6 +298,8 @@ int main() {
   test_bridged_edges();
   test_beacon_metric();
   test_relay_eviction();
+  test_relayable_types();
+  test_control_relay_semantics();
   if (g_fail) { printf("SOME TESTS FAILED\n"); return 1; }
   printf("ALL TESTS PASSED\n");
   return 0;

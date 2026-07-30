@@ -72,8 +72,8 @@ Pure logic in `src/router_attach.h`, radio glue in `src/attach.{h,cpp}`, host-te
 `tests/test_attach/test_attach.cpp`.
 
 Three single-hop frames, all riding the same `AMPS` header (`ttl = 1`, never relayed — the relay
-rule is now "only `SENSOR_SYNC_MSG_SNAPSHOT` travels multi-hop", so control frames cannot leak
-across the mesh):
+whitelist `ss_router_is_relayable()` admits `SENSOR_SYNC_MSG_SNAPSHOT` and
+`SENSOR_SYNC_MSG_CONTROL` only, so the router's own plane cannot leak across the mesh):
 
 | msgType | Frame | Direction | Payload |
 |---|---|---|---|
