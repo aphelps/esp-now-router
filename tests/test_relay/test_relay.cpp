@@ -87,6 +87,29 @@ static void test_control_relay_semantics() {
   CHECK(ss_router_should_relay(c11, SELF, tbl2, 4, &ttlOut), "interleaved: control 11 relays");
   CHECK(ss_router_should_relay(s12, SELF, tbl2, 4, &ttlOut), "interleaved: snapshot 12 relays");
 
+  // The three above are strictly increasing, so they relay whether the dedup table keys on
+  // (origin) or on (origin, msgType) — they do not actually test the named property. These do:
+  // a seq the origin has already spent must be refused REGARDLESS of the type carrying it, which
+  // is only true if the two types share one space. Under per-msgType dedup the control frame below
+  // would relay, and a snapshot and a control frame could then shadow each other's dedup state.
+  SensorRouterPeer tbl2b[4] = {};
+  SensorSyncHeader s20  = mkhdr_type(ORIGIN, 20, SS_DEFAULT_TTL, SENSOR_SYNC_MSG_SNAPSHOT);
+  SensorSyncHeader c20  = mkhdr_type(ORIGIN, 20, SS_DEFAULT_TTL, SENSOR_SYNC_MSG_CONTROL);
+  SensorSyncHeader c19  = mkhdr_type(ORIGIN, 19, SS_DEFAULT_TTL, SENSOR_SYNC_MSG_CONTROL);
+  CHECK(ss_router_should_relay(s20, SELF, tbl2b, 4, &ttlOut), "snapshot 20 relays");
+  CHECK(!ss_router_should_relay(c20, SELF, tbl2b, 4, &ttlOut),
+        "control reusing seq 20 is a duplicate — the seq space is shared, not per-msgType");
+  CHECK(!ss_router_should_relay(c19, SELF, tbl2b, 4, &ttlOut),
+        "and a control frame BEHIND the snapshot's seq is stale in that same shared space");
+
+  // Symmetric: the ordering must not depend on which type happened to arrive first.
+  SensorRouterPeer tbl2c[4] = {};
+  SensorSyncHeader c30 = mkhdr_type(ORIGIN, 30, SS_DEFAULT_TTL, SENSOR_SYNC_MSG_CONTROL);
+  SensorSyncHeader s30 = mkhdr_type(ORIGIN, 30, SS_DEFAULT_TTL, SENSOR_SYNC_MSG_SNAPSHOT);
+  CHECK(ss_router_should_relay(c30, SELF, tbl2c, 4, &ttlOut), "control 30 relays");
+  CHECK(!ss_router_should_relay(s30, SELF, tbl2c, 4, &ttlOut),
+        "snapshot reusing seq 30 is likewise a duplicate");
+
   // A single-hop type must be dropped by should_relay even when everything else says relay, and
   // must NOT consume dedup state that a later real frame depends on.
   SensorRouterPeer tbl3[4] = {};
