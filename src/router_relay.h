@@ -39,9 +39,17 @@ static inline SensorRouterPeer *ss_router_relay_slot(SensorRouterPeer *tbl, uint
 // deliberately lists it here. TIMEBASE is absent on purpose: it is reserved but unimplemented, and
 // a beacon whose whole value is *when* it arrived should not be forwarded by a hop that adds
 // unmeasured delay. Whoever implements it owns that decision.
+//
+// CTRL_QUERY / CTRL_CLOCK are relayed because reboot recovery must cross the backbone: control
+// frames are deliberately never re-broadcast, so a node whose only peers sit behind a router
+// would otherwise collect zero replies and stay muted until someone else originates a command.
+// The reply window is time-bounded (~1.5s) so relayed replies either arrive in time or are
+// discarded by the querier; per-origin dedup and TTL bound the traffic like any other frame.
 static inline bool ss_router_is_relayable(uint8_t msgType) {
   return msgType == SENSOR_SYNC_MSG_SNAPSHOT ||
-         msgType == SENSOR_SYNC_MSG_CONTROL;
+         msgType == SENSOR_SYNC_MSG_CONTROL  ||
+         msgType == SENSOR_SYNC_MSG_CTRL_QUERY ||
+         msgType == SENSOR_SYNC_MSG_CTRL_CLOCK;
 }
 
 // Relay decision for a router. Returns true iff `h` should be re-broadcast, and writes the TTL to

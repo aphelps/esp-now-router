@@ -43,6 +43,11 @@ static SensorSyncHeader mkhdr_type(uint32_t dev, uint16_t seq, uint8_t ttl, uint
 static void test_relayable_types() {
   CHECK(ss_router_is_relayable(SENSOR_SYNC_MSG_SNAPSHOT),  "snapshots relay");
   CHECK(ss_router_is_relayable(SENSOR_SYNC_MSG_CONTROL),   "control frames relay");
+  // Reboot recovery must cross the backbone: a rebooted node whose only peers sit behind a
+  // router would otherwise collect zero clock replies and stay muted until someone else
+  // originates a command.
+  CHECK(ss_router_is_relayable(SENSOR_SYNC_MSG_CTRL_QUERY), "clock queries relay");
+  CHECK(ss_router_is_relayable(SENSOR_SYNC_MSG_CTRL_CLOCK), "clock replies relay");
 
   CHECK(!ss_router_is_relayable(SENSOR_SYNC_MSG_BEACON),     "election beacon stays single-hop");
   CHECK(!ss_router_is_relayable(SENSOR_SYNC_MSG_ROUTER_ADV), "router heartbeat stays single-hop");
