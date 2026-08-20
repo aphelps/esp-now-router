@@ -13,6 +13,7 @@
 #include "hmtl_to_wled.h"
 #include "wled_onboard_cfg.h"
 #include "wled_candidate.h"
+#include "coordinator_boot.h"
 
 // Wire-facing sizes must not drift with the toolchain.
 static_assert(sizeof(WledColour) == 3, "WledColour is three bytes");
@@ -43,3 +44,8 @@ static_assert(WLED_TRANSLATE_MAX_BODY >= 44 + 3 + 3 + 3 + 3 + 1,
 // rather than as a scan that silently matches nothing.
 static_assert(WLED_DEFAULT_AP_CHANNEL == 6, "apChannel default is 6 (wled.h:368), not 1");
 static_assert(sizeof(WLED_SETUP_AP_PASS) == 9, "\"wled1234\" plus NUL — the AP is NOT open");
+
+// The reboot-loop brake must actually terminate. A threshold of 0 or 1 would blacklist on the very
+// first fault (or immediately), and anything that cannot reach the ceiling never breaks the loop.
+static_assert(COORD_MAX_ATTEMPTS >= 1, "at least one attempt before blacklisting");
+static_assert(COORD_MAX_ATTEMPTS < 0xFF, "the threshold must be reachable by a uint8_t counter");
