@@ -84,19 +84,11 @@ static void test_control_relay_semantics() {
 
   // Snapshots and control frames from one origin share a single seq space (the edge stamps both
   // from one txSeq counter), so they must not shadow each other in the dedup table.
-  SensorRouterPeer tbl2[4] = {};
-  SensorSyncHeader s10 = mkhdr_type(ORIGIN, 10, SS_DEFAULT_TTL, SENSOR_SYNC_MSG_SNAPSHOT);
-  SensorSyncHeader c11 = mkhdr_type(ORIGIN, 11, SS_DEFAULT_TTL, SENSOR_SYNC_MSG_CONTROL);
-  SensorSyncHeader s12 = mkhdr_type(ORIGIN, 12, SS_DEFAULT_TTL, SENSOR_SYNC_MSG_SNAPSHOT);
-  CHECK(ss_router_should_relay(s10, SELF, tbl2, 4, &ttlOut), "interleaved: snapshot 10 relays");
-  CHECK(ss_router_should_relay(c11, SELF, tbl2, 4, &ttlOut), "interleaved: control 11 relays");
-  CHECK(ss_router_should_relay(s12, SELF, tbl2, 4, &ttlOut), "interleaved: snapshot 12 relays");
-
-  // The three above are strictly increasing, so they relay whether the dedup table keys on
-  // (origin) or on (origin, msgType) — they do not actually test the named property. These do:
-  // a seq the origin has already spent must be refused REGARDLESS of the type carrying it, which
-  // is only true if the two types share one space. Under per-msgType dedup the control frame below
-  // would relay, and a snapshot and a control frame could then shadow each other's dedup state.
+  //
+  // The property is that a seq the origin has already spent is refused REGARDLESS of the type
+  // carrying it, which is only true if the two types share one space. Under per-msgType dedup the
+  // control frame below would relay, and a snapshot and a control frame could then shadow each
+  // other's dedup state.
   SensorRouterPeer tbl2b[4] = {};
   SensorSyncHeader s20  = mkhdr_type(ORIGIN, 20, SS_DEFAULT_TTL, SENSOR_SYNC_MSG_SNAPSHOT);
   SensorSyncHeader c20  = mkhdr_type(ORIGIN, 20, SS_DEFAULT_TTL, SENSOR_SYNC_MSG_CONTROL);

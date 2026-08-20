@@ -20,6 +20,23 @@ edge ──ESP-NOW─┘   (relay + leader)          └─ESP-NOW── edge
 
 ## Relay
 
+**What crosses the backbone** is decided by `ss_router_is_relayable()`: `SENSOR_SYNC_MSG_SNAPSHOT`,
+`SENSOR_SYNC_MSG_CONTROL`, and the clock-recovery pair `SENSOR_SYNC_MSG_CTRL_QUERY` /
+`SENSOR_SYNC_MSG_CTRL_CLOCK`. Everything else — the router's own advertisement and attach plane —
+is single-hop by omission from that list. The whitelist is pinned in both directions by
+`tests/test_relay/test_relay.cpp`: widening it to `return true`, or adding `TIMEBASE` or `BEACON`,
+each fails the suite.
+
+All relayable types from one origin share **one** seq space, because the edge stamps every frame
+from a single `txSeq` counter. The dedup table below is therefore keyed on origin alone, never on
+`(origin, msgType)` — keying per type would let a snapshot and a control frame shadow each other.
+
+> **Known limitation (not yet fixed):** `txSeq` is RAM-only, so a rebooted edge restarts at `seq 0`
+> while routers still hold its pre-reboot `lastSeq`, and dedup rule 1 drops everything it sends
+> until its seq climbs past that mark. `CTRL_QUERY` is one-shot, so a node whose only peers sit
+> behind a router does **not** currently recover its clock across the backbone — relaying the pair
+> is necessary for that recovery but not sufficient. See the review discussion on PR #3.
+
 Loop-free flood with two independent stoppers:
 
 1. **Per-origin seq dedup** (primary loop terminator): each router keeps a `(deviceId → lastSeq)`
@@ -72,9 +89,10 @@ Pure logic in `src/router_attach.h`, radio glue in `src/attach.{h,cpp}`, host-te
 `tests/test_attach/test_attach.cpp`.
 
 Three single-hop frames, all riding the same `AMPS` header (`ttl = 1`, never relayed — the relay
-whitelist `ss_router_is_relayable()` admits `SENSOR_SYNC_MSG_SNAPSHOT`, `SENSOR_SYNC_MSG_CONTROL`
-and the clock-recovery pair `SENSOR_SYNC_MSG_CTRL_QUERY`/`SENSOR_SYNC_MSG_CTRL_CLOCK`, so the
-router's own plane cannot leak across the mesh):
+whitelist `ss_router_is_relayable()` does **not** admit them, which is what keeps the router's own
+plane from leaking across the mesh. What it does admit is `SENSOR_SYNC_MSG_SNAPSHOT`,
+`SENSOR_SYNC_MSG_CONTROL` and the clock-recovery pair
+`SENSOR_SYNC_MSG_CTRL_QUERY`/`SENSOR_SYNC_MSG_CTRL_CLOCK`):
 
 | msgType | Frame | Direction | Payload |
 |---|---|---|---|
