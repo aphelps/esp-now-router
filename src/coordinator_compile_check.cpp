@@ -12,6 +12,7 @@
 #include "coordinator_phase.h"
 #include "hmtl_to_wled.h"
 #include "wled_onboard_cfg.h"
+#include "wled_candidate.h"
 
 // Wire-facing sizes must not drift with the toolchain.
 static_assert(sizeof(WledColour) == 3, "WledColour is three bytes");
@@ -37,3 +38,8 @@ static_assert(COORD_SETTLE_MS >= WLED_STA_RETRY_MS,
 // 3-digit channels plus a 3-digit brightness plus the NUL.
 static_assert(WLED_TRANSLATE_MAX_BODY >= 44 + 3 + 3 + 3 + 3 + 1,
               "WLED_TRANSLATE_MAX_BODY covers the worst-case body");
+
+// The setup-AP facts the matcher depends on. If WLED ever changes them, this fails at BUILD time
+// rather than as a scan that silently matches nothing.
+static_assert(WLED_DEFAULT_AP_CHANNEL == 6, "apChannel default is 6 (wled.h:368), not 1");
+static_assert(sizeof(WLED_SETUP_AP_PASS) == 9, "\"wled1234\" plus NUL — the AP is NOT open");
