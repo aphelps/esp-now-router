@@ -457,8 +457,19 @@ static bool syncKnownStep(const char *bodyBuf) {
 // Fixed by making the two take turns (see the guard at the top of sweepStep, and the matching one
 // in reconcileEspNowChannel). Result: a sweep that had been finding 2 of 4 devices now finds 4 of 4.
 //
-// Congestion was the wrong theory: pacing the probes changed nothing, because the radio was not
-// busy, it was ELSEWHERE.
+// CORRECTION to an earlier claim in this file's history: I wrote that "pacing changed nothing".
+// That was wrong, and the completed measurement says so. Full picture, one LAN, four devices:
+//
+//   1 probe,  no pacing                  2/4 found,  retryHits 0
+//   2 probes, no pacing                  3/4 found,  retryHits 1-2
+//   2 probes + pacing                    4/4 found,  retryHits 4   <- every device needed the retry
+//   2 probes + pacing + serialisation    4/4 found,  retryHits 1
+//
+// So all three changes contribute, but they are not equals. Serialising the scan and the sweep is
+// the one that removes the CAUSE — with it, retries go from carrying every device to carrying
+// almost none. Pacing and retrying were compensating for a radio that kept wandering off-channel;
+// they raised the hit rate without ever explaining it, which is exactly how a workaround looks when
+// you mistake it for a fix.
 //
 // Note the irony worth remembering — making the scan asynchronous earlier (a correct fix, since a
 // blocking scan took HTTP down every 20 s) is what created the overlap that caused this. The
