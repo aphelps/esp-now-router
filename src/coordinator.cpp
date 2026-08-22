@@ -27,7 +27,11 @@
 // How long orphans get to converge onto the home network after a push, before we sweep for them.
 // A WLED device retries its STA every 18 s (wled.cpp), so anything under that guarantees a miss.
 #ifndef COORD_SETTLE_MS
-#define COORD_SETTLE_MS 25000
+// 30 s, matching what coordinator_phase.h computes. They were 25000 here and 30000 there — separate
+// translation units, no warning, and both satisfied that header's static_assert, so the two could
+// drift indefinitely without anything complaining. A pushed device retries its STA every 18 s
+// (wled.cpp), so the window must clear that with margin.
+#define COORD_SETTLE_MS 30000
 #endif
 #ifndef COORD_SYNC_PERIOD_MS
 #define COORD_SYNC_PERIOD_MS 30000
@@ -46,12 +50,14 @@ static const char *NVS_NS   = "coord";
 static const char *NVS_SSID = "home_ssid";
 static const char *NVS_PASS = "home_pass";
 
-enum Phase : uint8_t { PH_BOOT = 0, PH_SCAN, PH_HOP, PH_SETTLE, PH_SYNC };
+// NOTE: there is deliberately no PH_HOP. The hop runs inline and blocking inside the PH_SCAN case
+// (bounded by COORD_HOP_BUDGET_MS), so the real transition is PH_SCAN -> PH_SETTLE. An enumerator
+// that can never be entered would misdescribe the machine to anyone reading /coordinator.
+enum Phase : uint8_t { PH_BOOT = 0, PH_SCAN, PH_SETTLE, PH_SYNC };
 static const char *phaseName(Phase p) {
   switch (p) {
     case PH_BOOT:   return "boot";
     case PH_SCAN:   return "scan";
-    case PH_HOP:    return "hop";
     case PH_SETTLE: return "settle";
     default:        return "sync";
   }
@@ -144,6 +150,13 @@ static bool onboardOne(const WledScanResult &cand) {
   DEBUG1_VALUELN("coord: hopping to ", cand.ssid);
   uint32_t deadline = millis() + COORD_HOP_BUDGET_MS;
 
+  // Every exit from here on goes through `done:`. The detach is not a courtesy — an early return
+  // while still associated to the target's setup AP strands us there, and it is invisible to the
+  // settle phase, which only asks WiFi.status() != WL_CONNECTED and gets "connected" (to the wrong
+  // network). It also backs the TARGET's own STA retry off from 18 s to 300 s (wled.cpp), delaying
+  // the exact join we are waiting for. Two failure paths used to return without detaching.
+  bool ok = false;
+
   WiFi.disconnect(true, true);
   delay(80);
   WiFi.mode(WIFI_STA);
@@ -151,48 +164,50 @@ static bool onboardOne(const WledScanResult &cand) {
   while (WiFi.status() != WL_CONNECTED) {
     if ((int32_t)(millis() - deadline) >= 0) {
       DEBUG_ERR("coord: join timed out");
-      st.hopFailures++;
-      return false;
+      goto done;                      // never associated, but detach anyway to clear WiFi state
     }
     delay(150);
   }
 
-  // Confirm it really is WLED before handing over credentials. The OUI pre-filter cannot do this —
-  // it only says the silicon is Espressif, not that the firmware is WLED.
-  String info;
-  if (httpGet(AP_HOST, "/json/info", &info) <= 0 || info.indexOf("\"brand\":\"WLED\"") < 0) {
-    DEBUG_ERR("coord: target did not identify as WLED — not pushing credentials");
-    st.hopFailures++;
-    return false;
+  {
+    // Confirm it really is WLED before handing over credentials. The OUI pre-filter cannot do this
+    // — it only says the silicon is Espressif, not that the firmware is WLED.
+    String info;
+    if (httpGet(AP_HOST, "/json/info", &info) <= 0 || info.indexOf("\"brand\":\"WLED\"") < 0) {
+      DEBUG_ERR("coord: target did not identify as WLED — not pushing credentials");
+      goto done;
+    }
+
+    WledOnboardCfg cfg = {};
+    cfg.ssid = homeSsid;
+    cfg.psk  = homePass;
+    uint8_t mac[6]; WiFi.macAddress(mac);
+    memcpy(cfg.coordinator_mac.b, mac, 6);
+    cfg.enable_espnow      = true;    // the radio itself; the MVP needs this and only this
+    cfg.enable_espnow_sync = false;   // NOT WLED's own sync master — we push state ourselves
+
+    char body[512]; size_t wrote = 0;
+    if (wled_build_onboard_cfg(cfg, body, sizeof(body), &wrote) != WLED_CFG_OK) {
+      DEBUG_ERR("coord: could not build onboarding cfg");
+      goto done;
+    }
+
+    int code = httpPost(AP_HOST, "/json/cfg", body, nullptr);
+    ok = (code >= 200 && code < 300);
+    DEBUG1_VALUELN("coord: cfg push http=", code);
+    if (ok) {
+      // A full push log means every slot is taken and we can no longer remember that this target
+      // was done — which is precisely the condition that makes the own-AP re-candidacy loop run
+      // forever. Say so rather than discarding the answer.
+      if (!wled_pushlog_add(&pushed, cand.bssid))
+        DEBUG_ERR("coord: push log FULL — this target may be re-pushed on the next scan");
+      st.onboarded++;
+    }
   }
 
-  WledOnboardCfg cfg = {};
-  cfg.ssid = homeSsid;
-  cfg.psk  = homePass;
-  uint8_t mac[6]; WiFi.macAddress(mac);
-  memcpy(cfg.coordinator_mac.b, mac, 6);
-  cfg.enable_espnow      = true;    // the radio itself; the MVP needs this and only this
-  cfg.enable_espnow_sync = false;   // NOT WLED's own sync master — we push state ourselves
-
-  char body[512]; size_t wrote = 0;
-  if (wled_build_onboard_cfg(cfg, body, sizeof(body), &wrote) != WLED_CFG_OK) {
-    DEBUG_ERR("coord: could not build onboarding cfg");
-    st.hopFailures++;
-    return false;
-  }
-
-  int code = httpPost(AP_HOST, "/json/cfg", body, nullptr);
-  bool ok = (code >= 200 && code < 300);
-  DEBUG1_VALUELN("coord: cfg push http=", code);
-  if (ok) {
-    wled_pushlog_add(&pushed, cand.bssid);
-    st.onboarded++;
-  } else {
-    st.hopFailures++;
-  }
-
-  // Detach and STAY off, whatever happened.
-  WiFi.disconnect(true, true);
+done:
+  if (!ok) st.hopFailures++;
+  WiFi.disconnect(true, true);        // detach and STAY off, on every path
   delay(120);
   return ok;
 }
@@ -257,17 +272,50 @@ static bool jsonPresentNotNull(const String &doc, const char *key) {
 // --- the registry ---------------------------------------------------------------------------------
 static CoordDevice devices[COORD_MAX_DEVICES];
 
-static CoordDevice *deviceSlot(uint8_t host) {
+// How long a device may go unseen before its record is treated as stale. Two sweeps' worth plus
+// slack: a device that misses one sweep to power-save should not vanish from the registry, but one
+// that has actually left must not linger forever claiming to be present — a stale record is worse
+// than a missing one, because callers act on it.
+#ifndef COORD_DEVICE_STALE_MS
+#define COORD_DEVICE_STALE_MS (COORD_SYNC_PERIOD_MS * 3)
+#endif
+
+static CoordDevice *deviceSlot(uint8_t host, uint32_t now) {
   for (uint8_t i = 0; i < COORD_MAX_DEVICES; i++)
     if (devices[i].used && devices[i].host == host) return &devices[i];
   for (uint8_t i = 0; i < COORD_MAX_DEVICES; i++)
     if (!devices[i].used) { memset(&devices[i], 0, sizeof(devices[i])); devices[i].used = true; devices[i].host = host; return &devices[i]; }
-  return nullptr;   // full: keep what we have rather than evicting something still live
+  // Full. Reclaim the most stale entry rather than refusing: refusing means a fleet that has churned
+  // past COORD_MAX_DEVICES addresses can never see a new device again, which is a worse failure than
+  // forgetting one that has not answered in three sweeps.
+  int oldest = -1; uint32_t oldestAge = 0;
+  for (uint8_t i = 0; i < COORD_MAX_DEVICES; i++) {
+    uint32_t age = now - devices[i].lastSeenMs;
+    if (age > oldestAge) { oldestAge = age; oldest = i; }
+  }
+  if (oldest >= 0 && oldestAge >= COORD_DEVICE_STALE_MS) {
+    memset(&devices[oldest], 0, sizeof(devices[oldest]));
+    devices[oldest].used = true; devices[oldest].host = host;
+    return &devices[oldest];
+  }
+  return nullptr;   // everything is fresh: keep what we have
+}
+
+// Drop records for devices that have not answered in a while, so /devices reports what is actually
+// there. Called once per completed sweep rather than per address.
+static void registryExpire(uint32_t now) {
+  for (uint8_t i = 0; i < COORD_MAX_DEVICES; i++) {
+    if (!devices[i].used) continue;
+    if ((uint32_t)(now - devices[i].lastSeenMs) >= COORD_DEVICE_STALE_MS) {
+      DEBUG1_VALUELN("coord: registry expiring host ", devices[i].host);
+      memset(&devices[i], 0, sizeof(devices[i]));
+    }
+  }
 }
 
 // Record everything we can learn about one device from the two documents we already fetch.
 static void registryNote(uint8_t host, const String &info, const String &state, uint32_t now) {
-  CoordDevice *d = deviceSlot(host);
+  CoordDevice *d = deviceSlot(host, now);
   if (!d) return;
   jsonStr(info, "mac",  d->mac,  sizeof(d->mac));
   jsonStr(info, "name", d->name, sizeof(d->name));
@@ -360,6 +408,7 @@ static bool sweepStep() {
       registryNote(sweepHost, info, stateDoc, millis());
   }
   if (sweepHost > 254) {
+    registryExpire(millis());          // a full pass has just visited every address
     st.discovered = sweepFound;
     st.synced     = sweepSet;
     DEBUG1_VALUE("coord: sync found ", sweepFound);

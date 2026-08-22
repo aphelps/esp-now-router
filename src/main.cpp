@@ -332,6 +332,39 @@ void setup() {
     httpServer.send(200, "application/json", j);
   });
   // Set the colour the fleet is driven to. Query args rather than a JSON body so it is one curl.
+  // The device registry. Everything here was learned from the sweep that already visits each
+  // device, so reading it costs nothing extra.
+  httpServer.on("/devices", HTTP_GET, [](){
+    uint8_t n = 0;
+    const CoordDevice *d = coordinatorDevices(&n);
+    uint32_t now = millis();
+    String j = "{\"count\":" + String(n) + ",\"devices\":[";
+    bool first = true;
+    for (uint8_t i = 0; i < COORD_MAX_DEVICES; i++) {
+      if (!d[i].used) continue;
+      if (!first) j += ",";
+      first = false;
+      j += "{\"host\":" + String(d[i].host);
+      j += ",\"mac\":\"" + String(d[i].mac) + "\"";
+      j += ",\"name\":\"" + String(d[i].name) + "\"";
+      j += ",\"ver\":\"" + String(d[i].ver) + "\"";
+      j += ",\"leds\":" + String(d[i].leds);
+      j += ",\"matrix\":" + String(d[i].matrix ? "true" : "false");
+      // Named apRssi, not rssi: this is the device's signal to the ACCESS POINT, which is a
+      // different measurement from heard[].rssiDirect in /routes (this node's radio path to it).
+      // Conflating the two would put every device on a sphere around the router.
+      j += ",\"apRssi\":" + String(d[i].apRssi);
+      j += ",\"apSignalPct\":" + String(d[i].apSignalPct);
+      j += ",\"on\":" + String(d[i].on ? "true" : "false");
+      j += ",\"bri\":" + String(d[i].bri);
+      j += ",\"fx\":" + String(d[i].fx);
+      j += ",\"pal\":" + String(d[i].pal);
+      j += ",\"col\":[" + String(d[i].r) + "," + String(d[i].g) + "," + String(d[i].b) + "]";
+      j += ",\"seenMsAgo\":" + String(now - d[i].lastSeenMs) + "}";
+    }
+    j += "]}";
+    httpServer.send(200, "application/json", j);
+  });
   httpServer.on("/target", HTTP_POST, [](){
     long r = httpServer.arg("r").toInt(), g = httpServer.arg("g").toInt(), b = httpServer.arg("b").toInt();
     if (r < 0 || r > 255 || g < 0 || g > 255 || b < 0 || b > 255) {
