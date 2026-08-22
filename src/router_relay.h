@@ -30,16 +30,31 @@ static inline SensorRouterPeer *ss_router_relay_slot(SensorRouterPeer *tbl, uint
   return &tbl[0];
 }
 
-// Does this msgType travel multi-hop? Only sensor snapshots do. Every other type — the election
-// beacon, the router heartbeat, and the attach handshake — is a single-hop control frame consumed
-// by whichever node hears it, so relaying one would leak local control state across the mesh.
+// Does this msgType travel multi-hop? Sensor snapshots and UI/preset commands do: both are
+// installation-wide state that every node needs. The router's own plane — the election beacon, the
+// heartbeat and the attach handshake — is single-hop and consumed by whichever node hears it, so
+// relaying one would leak a local routing decision across the whole mesh.
+//
+// This is a whitelist, not a blacklist, so a msgType added later stays single-hop until someone
+// deliberately lists it here. TIMEBASE is absent on purpose: it is reserved but unimplemented, and
+// a beacon whose whole value is *when* it arrived should not be forwarded by a hop that adds
+// unmeasured delay. Whoever implements it owns that decision.
+//
+// CTRL_QUERY / CTRL_CLOCK are relayed because reboot recovery must cross the backbone: control
+// frames are deliberately never re-broadcast, so a node whose only peers sit behind a router
+// would otherwise collect zero replies and stay muted until someone else originates a command.
+// The reply window is time-bounded (~1.5s) so relayed replies either arrive in time or are
+// discarded by the querier; per-origin dedup and TTL bound the traffic like any other frame.
 static inline bool ss_router_is_relayable(uint8_t msgType) {
-  return msgType == SENSOR_SYNC_MSG_SNAPSHOT;
+  return msgType == SENSOR_SYNC_MSG_SNAPSHOT ||
+         msgType == SENSOR_SYNC_MSG_CONTROL  ||
+         msgType == SENSOR_SYNC_MSG_CTRL_QUERY ||
+         msgType == SENSOR_SYNC_MSG_CTRL_CLOCK;
 }
 
 // Relay decision for a router. Returns true iff `h` should be re-broadcast, and writes the TTL to
 // stamp on the outgoing copy to *outTtl. `selfId` is this node's deviceId. Rules:
-//   0a. Control frames (anything but a snapshot) are single-hop -> drop.
+//   0a. Non-relayable types (the router's own beacon/heartbeat/attach plane) are single-hop -> drop.
 //   0b. Self: never relay a frame we originated (its echo looping back) -> drop. Lets a node that is
 //      both an edge (originator) and a relay coexist; for a pure router selfId never matches.
 //   1. Dedup: a frame whose seq is not newer than the last seen from this origin is a duplicate
