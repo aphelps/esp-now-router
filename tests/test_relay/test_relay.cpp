@@ -309,6 +309,62 @@ static void test_relay_eviction() {
   CHECK(!ss_router_should_relay(mkhdr(1, 7, 6), self, tbl, N, &out), "re-admitted origin 1 deduped again (bounded)");
 }
 
+// The reboot case the clock-recovery pair exists for (esp-now-router#3 HIGH). This is the router
+// side of the WLED-side reservation test: there the assertion is expressed through ss_seq_newer,
+// here it is the router's ACTUAL relay decision, which is the thing that was broken.
+//
+// Before the fix a rebooted edge restarted at seq 0 while this table still held its pre-reboot
+// lastSeq, so dedup rule 1 dropped its CTRL_QUERY and everything behind it. The frame that starts
+// reboot recovery was itself the first casualty, which is why relaying the pair was necessary but
+// not sufficient.
+static void test_reboot_seq_recovery() {
+  SensorRouterPeer tbl[4] = {};
+  const uint32_t EDGE = 0xAB12CD34, SELF = 0x00FF00FF;
+  uint8_t ttl = 0;
+
+  // The edge has been talking for a while; the router's dedup state tracks it.
+  uint16_t seq = 0;
+  for (int i = 0; i < 5000; i++) {
+    SensorSyncHeader h = mkhdr(EDGE, seq++, SS_DEFAULT_TTL);
+    h.msgType = SENSOR_SYNC_MSG_SNAPSHOT;
+    CHECK(ss_router_should_relay(h, SELF, tbl, 4, &ttl), "pre-reboot traffic relays");
+  }
+  const uint16_t lastPreReboot = (uint16_t)(seq - 1);
+
+  // What the RAM-only counter did: restart at 0. The router is entitled to call this a duplicate,
+  // and did — this asserts the bug is real, so the next block is not testing a straw man.
+  {
+    SensorSyncHeader h = mkhdr(EDGE, 0, SS_DEFAULT_TTL);
+    h.msgType = SENSOR_SYNC_MSG_CTRL_QUERY;
+    CHECK(!ss_router_should_relay(h, SELF, tbl, 4, &ttl),
+          "restarting at seq 0 IS dropped — the failure this fix removes");
+  }
+
+  // What the reservation does: resume at the persisted ceiling. The edge spent 5000 seqs, so its
+  // ceiling had advanced past them in SS_SEQ_RESERVE-sized blocks.
+  // The block width is the edge's business (SS_SEQ_RESERVE in sensor_control.h); the router does
+  // not include that header and must not need to. Model it locally — what the router cares about is
+  // only that the resumed seq is above everything it has seen.
+  const uint16_t RESERVE = 1000;
+  uint16_t ceiling = 0;
+  while (!ss_seq_newer(ceiling, lastPreReboot)) ceiling = (uint16_t)(ceiling + RESERVE);
+  {
+    SensorSyncHeader h = mkhdr(EDGE, ceiling, SS_DEFAULT_TTL);
+    h.msgType = SENSOR_SYNC_MSG_CTRL_QUERY;
+    CHECK(ss_router_should_relay(h, SELF, tbl, 4, &ttl),
+          "the post-reboot CTRL_QUERY is relayed, so recovery can start");
+  }
+
+  // And the frames behind it — the reproduction was 4999 further drops, not one.
+  uint16_t s2 = (uint16_t)(ceiling + 1);
+  for (int i = 0; i < 100; i++) {
+    SensorSyncHeader h = mkhdr(EDGE, s2++, SS_DEFAULT_TTL);
+    h.msgType = SENSOR_SYNC_MSG_SNAPSHOT;
+    CHECK(ss_router_should_relay(h, SELF, tbl, 4, &ttl),
+          "and the traffic behind it is relayed too");
+  }
+}
+
 int main() {
   test_wire_compat();
   test_unit();
@@ -320,6 +376,7 @@ int main() {
   test_relay_eviction();
   test_relayable_types();
   test_control_relay_semantics();
+  test_reboot_seq_recovery();
   if (g_fail) { printf("SOME TESTS FAILED\n"); return 1; }
   printf("ALL TESTS PASSED\n");
   return 0;
