@@ -431,6 +431,11 @@ static void reconcileEspNowChannel(uint32_t now) {
   // Deliberately NOT gated on WL_CONNECTED. Gating on it deadlocks: a wrong pinned channel is
   // exactly what stops the association, so a repair that waits for the association never runs.
   // WiFi.channel() reports the channel the STA is working with even while it is still associating.
+  // Ignore the reading entirely while a scan is running: WiFi.channel() then reports whichever
+  // channel the scan is currently sitting on, not the AP's. Acting on it makes the coordinator
+  // "follow" a walk through channels 2, 8, 12, 14 — observed on the bench — and in standalone mode
+  // would actively drag the radio around with setChannel().
+  if (WiFi.scanComplete() == WIFI_SCAN_RUNNING) return;
   uint8_t apCh = (uint8_t)WiFi.channel();
   if (apCh == 0 || apCh == espnowChannel) return;
 

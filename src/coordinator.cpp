@@ -388,6 +388,11 @@ const CoordDevice *coordinatorDevices(uint8_t *countOut) {
 // Two attempts at COORD_DISCOVER_TIMEOUT_MS cost about the same wall clock as the single longer
 // probe they replace, but give two independent chances at a device that simply did not answer the
 // first time.
+// Gap between probes, and between the two attempts on one address. See the pacing note in
+// sweepStep for why this exists.
+#ifndef COORD_PROBE_GAP_MS
+#define COORD_PROBE_GAP_MS 60
+#endif
 #ifndef COORD_PROBE_ATTEMPTS
 #define COORD_PROBE_ATTEMPTS 2
 #endif
@@ -427,8 +432,8 @@ static bool syncKnownStep(const char *bodyBuf) {
 }
 
 // Returns true when the sweep has finished this pass over the subnet.
-// KNOWN LIMITATION — discovery is not yet reliable, and the numbers are here so the next person
-// does not have to rediscover them.
+// DISCOVERY: the cause of the missed devices was found, and it was none of the first three things
+// it looked like. Kept in full because the wrong answers are the useful part.
 //
 // A full /24 HTTP sweep from the ESP32 misses devices that are demonstrably present. Measured on a
 // LAN with four WLED devices (.27 .52 .64 .65):
@@ -443,17 +448,35 @@ static bool syncKnownStep(const char *bodyBuf) {
 //   - the self-skip: /coordinator reports selfHost 66, correct
 //   - the cursor skipping addresses: it advances two per pass, so odd-only snapshots are expected
 //
-// Leading hypothesis, untested: the sweep is saturating its own radio. During a sweep the
-// coordinator's ping latency rises to 380-590 ms and its own HTTP goes intermittent, which is the
-// signature of back-to-back TCP connects starving the WiFi task. If so the fix is to PACE the
-// sweep (a short delay between probes) rather than to lengthen timeouts, and a slower sweep would
-// be both kinder and more complete.
+// ACTUAL CAUSE — the async WiFi scan and the HTTP sweep were sharing one radio. A scan HOPS across
+// every channel, so for most of its duration the ESP32 is not on the AP's channel at all: probes
+// time out against healthy devices, ESP-NOW adverts fail, and WiFi.channel() returns the SCAN's
+// channel. The serial log made it plain — "espnow: on AP channel 2 (was 9", then 8, then 12, then
+// 14 — the reconciliation faithfully following a scan around the band.
+//
+// Fixed by making the two take turns (see the guard at the top of sweepStep, and the matching one
+// in reconcileEspNowChannel). Result: a sweep that had been finding 2 of 4 devices now finds 4 of 4.
+//
+// Congestion was the wrong theory: pacing the probes changed nothing, because the radio was not
+// busy, it was ELSEWHERE.
+//
+// Note the irony worth remembering — making the scan asynchronous earlier (a correct fix, since a
+// blocking scan took HTTP down every 20 s) is what created the overlap that caused this. The
+// blocking version hid it by never running concurrently with anything.
 //
 // Practical impact today: devices already in the registry are driven promptly by the known-host
 // fast path, so a running installation stays in sync. It is a NEWLY onboarded device that can wait
 // through a sweep or two before it is first driven. Onboarding itself is unaffected.
 static bool sweepStep() {
   if (WiFi.status() != WL_CONNECTED) return true;
+  // NEVER sweep while a scan is in flight. This is the real cause of the missed devices, and it is
+  // not congestion: an async WiFi scan HOPS THE RADIO across every channel, so for most of the scan
+  // the ESP32 is simply not on the AP's channel. HTTP probes issued in that window time out against
+  // devices that are perfectly healthy, ESP-NOW sends fail ("attach: advert send failed"), and
+  // WiFi.channel() returns the SCAN's current channel — which is why the channel reconciliation was
+  // logging a walk through channels 2, 8, 12, 14. One radio cannot scan and hold a connection at
+  // the same time; the two phases have to take turns.
+  if (WiFi.scanComplete() == WIFI_SCAN_RUNNING) return false;
   IPAddress me = WiFi.localIP();
   char bodyBuf[WLED_TRANSLATE_MAX_BODY];
   size_t n = wled_body_solid(target, COORD_TARGET_BRI, bodyBuf, sizeof(bodyBuf));
@@ -482,8 +505,14 @@ static bool sweepStep() {
     for (int a = 0; a < COORD_PROBE_ATTEMPTS; a++) {
       rc = httpGetT(ip, "/json/info", &info, COORD_DISCOVER_TIMEOUT_MS);
       if (rc > 0) { if (a > 0) sweepRetryHits++; break; }
-      delay(10);
+      delay(COORD_PROBE_GAP_MS);
     }
+    // Pace the sweep. Back-to-back TCP connects from the ESP32 appear to starve its own WiFi task:
+    // during an unpaced sweep the coordinator's ping latency rose to 380-590 ms and its own HTTP
+    // went intermittent, while devices that answer the host in under 100 ms were being missed. A
+    // short gap costs a few seconds across a /24 and is the cheapest thing to try before reaching
+    // for longer timeouts.
+    delay(COORD_PROBE_GAP_MS);
     if (rc <= 0) continue;
     if (info.indexOf("\"brand\":\"WLED\"") < 0) continue;
     sweepFound++;
