@@ -29,6 +29,94 @@ static SensorSyncHeader mkhdr(uint32_t dev, uint16_t seq, uint8_t ttl) {
   return h;
 }
 
+static SensorSyncHeader mkhdr_type(uint32_t dev, uint16_t seq, uint8_t ttl, uint8_t msgType) {
+  SensorSyncHeader h = mkhdr(dev, seq, ttl);
+  h.msgType = msgType;
+  return h;
+}
+
+// ---- 1b. Which msgTypes cross the backbone ----
+// The predicate is a whitelist, and until M4 it whitelisted snapshots alone. These assertions pin
+// BOTH directions: that control frames now travel, and that the router's own plane still does not.
+// A regression either way is silent in normal operation — a leaked beacon corrupts a distant
+// router's routing metric, and a dropped control frame just looks like flaky WiFi.
+static void test_relayable_types() {
+  CHECK(ss_router_is_relayable(SENSOR_SYNC_MSG_SNAPSHOT),  "snapshots relay");
+  CHECK(ss_router_is_relayable(SENSOR_SYNC_MSG_CONTROL),   "control frames relay");
+  // Reboot recovery must cross the backbone: a rebooted node whose only peers sit behind a
+  // router would otherwise collect zero clock replies and stay muted until someone else
+  // originates a command.
+  CHECK(ss_router_is_relayable(SENSOR_SYNC_MSG_CTRL_QUERY), "clock queries relay");
+  CHECK(ss_router_is_relayable(SENSOR_SYNC_MSG_CTRL_CLOCK), "clock replies relay");
+
+  CHECK(!ss_router_is_relayable(SENSOR_SYNC_MSG_BEACON),     "election beacon stays single-hop");
+  CHECK(!ss_router_is_relayable(SENSOR_SYNC_MSG_ROUTER_ADV), "router heartbeat stays single-hop");
+  CHECK(!ss_router_is_relayable(SENSOR_SYNC_MSG_ATTACH),     "attach stays single-hop");
+  CHECK(!ss_router_is_relayable(SENSOR_SYNC_MSG_ATTACH_ACK), "attach-ack stays single-hop");
+  // Reserved but deliberately not relayed — see the comment on the predicate.
+  CHECK(!ss_router_is_relayable(SENSOR_SYNC_MSG_TIMEBASE),   "timebase beacon stays single-hop");
+  // An unallocated type must not start travelling just because it exists.
+  CHECK(!ss_router_is_relayable(200), "unknown msgType stays single-hop");
+}
+
+// ---- 1c. Control frames get the same dedup + TTL treatment as snapshots ----
+static void test_control_relay_semantics() {
+  const uint32_t SELF = 0x000000AA, ORIGIN = 0x000000BB;
+  SensorRouterPeer tbl[4] = {};
+  uint8_t ttlOut = 0;
+
+  SensorSyncHeader c1 = mkhdr_type(ORIGIN, 1, SS_DEFAULT_TTL, SENSOR_SYNC_MSG_CONTROL);
+  CHECK(ss_router_should_relay(c1, SELF, tbl, 4, &ttlOut), "fresh control frame relays");
+  CHECK(ttlOut == SS_DEFAULT_TTL - 1, "control TTL is decremented like a snapshot's");
+
+  CHECK(!ss_router_should_relay(c1, SELF, tbl, 4, &ttlOut), "duplicate control frame dropped");
+
+  SensorSyncHeader c2 = mkhdr_type(ORIGIN, 2, SS_DEFAULT_TTL, SENSOR_SYNC_MSG_CONTROL);
+  CHECK(ss_router_should_relay(c2, SELF, tbl, 4, &ttlOut), "newer control frame relays");
+
+  // Exhausted hop budget drops, same as a snapshot.
+  SensorSyncHeader c3 = mkhdr_type(ORIGIN, 3, 1, SENSOR_SYNC_MSG_CONTROL);
+  CHECK(!ss_router_should_relay(c3, SELF, tbl, 4, &ttlOut), "control frame with ttl<=1 dropped");
+
+  // Our own control echo is never relayed.
+  SensorSyncHeader own = mkhdr_type(SELF, 9, SS_DEFAULT_TTL, SENSOR_SYNC_MSG_CONTROL);
+  CHECK(!ss_router_should_relay(own, SELF, tbl, 4, &ttlOut), "own control echo not relayed");
+
+  // Snapshots and control frames from one origin share a single seq space (the edge stamps both
+  // from one txSeq counter), so they must not shadow each other in the dedup table.
+  //
+  // The property is that a seq the origin has already spent is refused REGARDLESS of the type
+  // carrying it, which is only true if the two types share one space. Under per-msgType dedup the
+  // control frame below would relay, and a snapshot and a control frame could then shadow each
+  // other's dedup state.
+  SensorRouterPeer tbl2b[4] = {};
+  SensorSyncHeader s20  = mkhdr_type(ORIGIN, 20, SS_DEFAULT_TTL, SENSOR_SYNC_MSG_SNAPSHOT);
+  SensorSyncHeader c20  = mkhdr_type(ORIGIN, 20, SS_DEFAULT_TTL, SENSOR_SYNC_MSG_CONTROL);
+  SensorSyncHeader c19  = mkhdr_type(ORIGIN, 19, SS_DEFAULT_TTL, SENSOR_SYNC_MSG_CONTROL);
+  CHECK(ss_router_should_relay(s20, SELF, tbl2b, 4, &ttlOut), "snapshot 20 relays");
+  CHECK(!ss_router_should_relay(c20, SELF, tbl2b, 4, &ttlOut),
+        "control reusing seq 20 is a duplicate — the seq space is shared, not per-msgType");
+  CHECK(!ss_router_should_relay(c19, SELF, tbl2b, 4, &ttlOut),
+        "and a control frame BEHIND the snapshot's seq is stale in that same shared space");
+
+  // Symmetric: the ordering must not depend on which type happened to arrive first.
+  SensorRouterPeer tbl2c[4] = {};
+  SensorSyncHeader c30 = mkhdr_type(ORIGIN, 30, SS_DEFAULT_TTL, SENSOR_SYNC_MSG_CONTROL);
+  SensorSyncHeader s30 = mkhdr_type(ORIGIN, 30, SS_DEFAULT_TTL, SENSOR_SYNC_MSG_SNAPSHOT);
+  CHECK(ss_router_should_relay(c30, SELF, tbl2c, 4, &ttlOut), "control 30 relays");
+  CHECK(!ss_router_should_relay(s30, SELF, tbl2c, 4, &ttlOut),
+        "snapshot reusing seq 30 is likewise a duplicate");
+
+  // A single-hop type must be dropped by should_relay even when everything else says relay, and
+  // must NOT consume dedup state that a later real frame depends on.
+  SensorRouterPeer tbl3[4] = {};
+  SensorSyncHeader beacon = mkhdr_type(ORIGIN, 5, SS_DEFAULT_TTL, SENSOR_SYNC_MSG_BEACON);
+  CHECK(!ss_router_should_relay(beacon, SELF, tbl3, 4, &ttlOut), "beacon dropped by should_relay");
+  SensorSyncHeader ctrl5 = mkhdr_type(ORIGIN, 5, SS_DEFAULT_TTL, SENSOR_SYNC_MSG_CONTROL);
+  CHECK(ss_router_should_relay(ctrl5, SELF, tbl3, 4, &ttlOut),
+        "dropped beacon did not poison dedup state for a later frame");
+}
+
 // ---- 1. Wire compatibility: reserved->ttl/flags is same-size, same-offset ----
 static void test_wire_compat() {
   CHECK(sizeof(SensorSyncHeader) == 20, "header is still 20 bytes");
@@ -221,6 +309,62 @@ static void test_relay_eviction() {
   CHECK(!ss_router_should_relay(mkhdr(1, 7, 6), self, tbl, N, &out), "re-admitted origin 1 deduped again (bounded)");
 }
 
+// The reboot case the clock-recovery pair exists for (esp-now-router#3 HIGH). This is the router
+// side of the WLED-side reservation test: there the assertion is expressed through ss_seq_newer,
+// here it is the router's ACTUAL relay decision, which is the thing that was broken.
+//
+// Before the fix a rebooted edge restarted at seq 0 while this table still held its pre-reboot
+// lastSeq, so dedup rule 1 dropped its CTRL_QUERY and everything behind it. The frame that starts
+// reboot recovery was itself the first casualty, which is why relaying the pair was necessary but
+// not sufficient.
+static void test_reboot_seq_recovery() {
+  SensorRouterPeer tbl[4] = {};
+  const uint32_t EDGE = 0xAB12CD34, SELF = 0x00FF00FF;
+  uint8_t ttl = 0;
+
+  // The edge has been talking for a while; the router's dedup state tracks it.
+  uint16_t seq = 0;
+  for (int i = 0; i < 5000; i++) {
+    SensorSyncHeader h = mkhdr(EDGE, seq++, SS_DEFAULT_TTL);
+    h.msgType = SENSOR_SYNC_MSG_SNAPSHOT;
+    CHECK(ss_router_should_relay(h, SELF, tbl, 4, &ttl), "pre-reboot traffic relays");
+  }
+  const uint16_t lastPreReboot = (uint16_t)(seq - 1);
+
+  // What the RAM-only counter did: restart at 0. The router is entitled to call this a duplicate,
+  // and did — this asserts the bug is real, so the next block is not testing a straw man.
+  {
+    SensorSyncHeader h = mkhdr(EDGE, 0, SS_DEFAULT_TTL);
+    h.msgType = SENSOR_SYNC_MSG_CTRL_QUERY;
+    CHECK(!ss_router_should_relay(h, SELF, tbl, 4, &ttl),
+          "restarting at seq 0 IS dropped — the failure this fix removes");
+  }
+
+  // What the reservation does: resume at the persisted ceiling. The edge spent 5000 seqs, so its
+  // ceiling had advanced past them in SS_SEQ_RESERVE-sized blocks.
+  // The block width is the edge's business (SS_SEQ_RESERVE in sensor_control.h); the router does
+  // not include that header and must not need to. Model it locally — what the router cares about is
+  // only that the resumed seq is above everything it has seen.
+  const uint16_t RESERVE = 1000;
+  uint16_t ceiling = 0;
+  while (!ss_seq_newer(ceiling, lastPreReboot)) ceiling = (uint16_t)(ceiling + RESERVE);
+  {
+    SensorSyncHeader h = mkhdr(EDGE, ceiling, SS_DEFAULT_TTL);
+    h.msgType = SENSOR_SYNC_MSG_CTRL_QUERY;
+    CHECK(ss_router_should_relay(h, SELF, tbl, 4, &ttl),
+          "the post-reboot CTRL_QUERY is relayed, so recovery can start");
+  }
+
+  // And the frames behind it — the reproduction was 4999 further drops, not one.
+  uint16_t s2 = (uint16_t)(ceiling + 1);
+  for (int i = 0; i < 100; i++) {
+    SensorSyncHeader h = mkhdr(EDGE, s2++, SS_DEFAULT_TTL);
+    h.msgType = SENSOR_SYNC_MSG_SNAPSHOT;
+    CHECK(ss_router_should_relay(h, SELF, tbl, 4, &ttl),
+          "and the traffic behind it is relayed too");
+  }
+}
+
 int main() {
   test_wire_compat();
   test_unit();
@@ -230,6 +374,9 @@ int main() {
   test_bridged_edges();
   test_beacon_metric();
   test_relay_eviction();
+  test_relayable_types();
+  test_control_relay_semantics();
+  test_reboot_seq_recovery();
   if (g_fail) { printf("SOME TESTS FAILED\n"); return 1; }
   printf("ALL TESTS PASSED\n");
   return 0;
