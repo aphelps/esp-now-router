@@ -1,0 +1,444 @@
+// coordinator.cpp — see coordinator.h. Only the radio-facing half lives here.
+#ifdef WLED_COORDINATOR_ROLE
+
+#include "coordinator.h"
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Preferences.h>
+#include <Debug.h>
+
+#include "wled_candidate.h"
+#include "wled_onboard_cfg.h"
+#include "wled_translate.h"
+
+#ifndef COORD_HOME_SSID
+#define COORD_HOME_SSID ""
+#endif
+#ifndef COORD_HOME_PASS
+#define COORD_HOME_PASS ""
+#endif
+// One hop must be bounded or a target that half-answers strands us off the home network. Sized
+// above a worst-case join+push+verify, well below anything a human would wait through.
+#ifndef COORD_HOP_BUDGET_MS
+#define COORD_HOP_BUDGET_MS 45000
+#endif
+// How long orphans get to converge onto the home network after a push, before we sweep for them.
+// A WLED device retries its STA every 18 s (wled.cpp), so anything under that guarantees a miss.
+#ifndef COORD_SETTLE_MS
+#define COORD_SETTLE_MS 25000
+#endif
+#ifndef COORD_SYNC_PERIOD_MS
+#define COORD_SYNC_PERIOD_MS 30000
+#endif
+#ifndef COORD_SCAN_PERIOD_MS
+#define COORD_SCAN_PERIOD_MS 20000
+#endif
+#ifndef COORD_HTTP_TIMEOUT_MS
+#define COORD_HTTP_TIMEOUT_MS 4000
+#endif
+#ifndef COORD_TARGET_BRI
+#define COORD_TARGET_BRI 200
+#endif
+
+static const char *NVS_NS   = "coord";
+static const char *NVS_SSID = "home_ssid";
+static const char *NVS_PASS = "home_pass";
+
+enum Phase : uint8_t { PH_BOOT = 0, PH_SCAN, PH_HOP, PH_SETTLE, PH_SYNC };
+static const char *phaseName(Phase p) {
+  switch (p) {
+    case PH_BOOT:   return "boot";
+    case PH_SCAN:   return "scan";
+    case PH_HOP:    return "hop";
+    case PH_SETTLE: return "settle";
+    default:        return "sync";
+  }
+}
+
+static Phase       phase        = PH_BOOT;
+static uint32_t    phaseSince   = 0;
+static uint32_t    lastScanMs   = 0;
+static uint32_t    lastSyncMs   = 0;
+static WledPushLog pushed;
+static WledColour  target       = { 255, 0, 0 };   // Adam's acceptance shape: solid red by default
+static CoordinatorStatus st     = {};
+static char        homeSsid[33] = {0};
+static char        homePass[65] = {0};
+
+// --- home config -------------------------------------------------------------------------------
+// Persisted BEFORE the first hop, not after: a watchdog reset mid-hop must come back knowing where
+// home is, and a value that only exists in RAM is exactly what a reset destroys.
+static void loadHome() {
+  Preferences p;
+  if (p.begin(NVS_NS, true)) {
+    String s = p.getString(NVS_SSID, ""), k = p.getString(NVS_PASS, "");
+    p.end();
+    if (s.length()) { strncpy(homeSsid, s.c_str(), sizeof(homeSsid) - 1); strncpy(homePass, k.c_str(), sizeof(homePass) - 1); return; }
+  }
+  strncpy(homeSsid, COORD_HOME_SSID, sizeof(homeSsid) - 1);
+  strncpy(homePass, COORD_HOME_PASS, sizeof(homePass) - 1);
+}
+
+static void storeHome() {
+  Preferences p;
+  if (!p.begin(NVS_NS, false)) return;
+  p.putString(NVS_SSID, homeSsid);
+  p.putString(NVS_PASS, homePass);
+  p.end();
+}
+
+static bool joinHome(uint32_t timeoutMs) {
+  WiFi.disconnect(true, true);
+  delay(80);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(homeSsid, homePass);
+  uint32_t t0 = millis();
+  while (millis() - t0 < timeoutMs) {
+    if (WiFi.status() == WL_CONNECTED) { st.homeUp = true; return true; }
+    delay(150);
+  }
+  st.homeUp = false;
+  return false;
+}
+
+// --- HTTP helpers ------------------------------------------------------------------------------
+static int httpPost(const char *host, const char *path, const char *body, String *out) {
+  HTTPClient http;
+  String url = String("http://") + host + path;
+  if (!http.begin(url)) return -1;
+  http.setTimeout(COORD_HTTP_TIMEOUT_MS);
+  http.addHeader("Content-Type", "application/json");
+  int code = http.POST((uint8_t *)body, strlen(body));
+  if (out && code > 0) *out = http.getString();
+  http.end();
+  return code;
+}
+
+static int httpGetT(const char *host, const char *path, String *out, uint16_t timeoutMs) {
+  HTTPClient http;
+  String url = String("http://") + host + path;
+  if (!http.begin(url)) return -1;
+  http.setConnectTimeout(timeoutMs);
+  http.setTimeout(timeoutMs);
+  int code = http.GET();
+  if (out && code > 0) *out = http.getString();
+  http.end();
+  return code;
+}
+
+static int httpGet(const char *host, const char *path, String *out) {
+  return httpGetT(host, path, out, COORD_HTTP_TIMEOUT_MS);
+}
+
+// A stock WLED device in AP-fallback always answers on 4.3.2.1 — its own captive-portal address.
+static const char *AP_HOST = "4.3.2.1";
+
+// --- onboarding one target ---------------------------------------------------------------------
+// Returns true if the target accepted our credentials. Leaves the radio detached from the target AP
+// either way: staying associated backs the target's own STA retry off from 18 s to 300 s
+// (wled.cpp), which delays the exact join we are waiting for.
+static bool onboardOne(const WledScanResult &cand) {
+  st.hops++;
+  DEBUG1_VALUELN("coord: hopping to ", cand.ssid);
+  uint32_t deadline = millis() + COORD_HOP_BUDGET_MS;
+
+  WiFi.disconnect(true, true);
+  delay(80);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(cand.ssid, WLED_SETUP_AP_PASS);
+  while (WiFi.status() != WL_CONNECTED) {
+    if ((int32_t)(millis() - deadline) >= 0) {
+      DEBUG_ERR("coord: join timed out");
+      st.hopFailures++;
+      return false;
+    }
+    delay(150);
+  }
+
+  // Confirm it really is WLED before handing over credentials. The OUI pre-filter cannot do this —
+  // it only says the silicon is Espressif, not that the firmware is WLED.
+  String info;
+  if (httpGet(AP_HOST, "/json/info", &info) <= 0 || info.indexOf("\"brand\":\"WLED\"") < 0) {
+    DEBUG_ERR("coord: target did not identify as WLED — not pushing credentials");
+    st.hopFailures++;
+    return false;
+  }
+
+  WledOnboardCfg cfg = {};
+  cfg.ssid = homeSsid;
+  cfg.psk  = homePass;
+  uint8_t mac[6]; WiFi.macAddress(mac);
+  memcpy(cfg.coordinator_mac.b, mac, 6);
+  cfg.enable_espnow      = true;    // the radio itself; the MVP needs this and only this
+  cfg.enable_espnow_sync = false;   // NOT WLED's own sync master — we push state ourselves
+
+  char body[512]; size_t wrote = 0;
+  if (wled_build_onboard_cfg(cfg, body, sizeof(body), &wrote) != WLED_CFG_OK) {
+    DEBUG_ERR("coord: could not build onboarding cfg");
+    st.hopFailures++;
+    return false;
+  }
+
+  int code = httpPost(AP_HOST, "/json/cfg", body, nullptr);
+  bool ok = (code >= 200 && code < 300);
+  DEBUG1_VALUELN("coord: cfg push http=", code);
+  if (ok) {
+    wled_pushlog_add(&pushed, cand.bssid);
+    st.onboarded++;
+  } else {
+    st.hopFailures++;
+  }
+
+  // Detach and STAY off, whatever happened.
+  WiFi.disconnect(true, true);
+  delay(120);
+  return ok;
+}
+
+
+// --- minimal JSON field extraction ----------------------------------------------------------------
+// Deliberately not a JSON parser. WLED's /json/info is several kB and a real parser would cost more
+// heap than the whole registry; these pull single well-known fields out of a response we already
+// hold as a String. `scope` optionally narrows the search to the object after a given key, so
+// "rssi" inside "wifi" cannot be confused with an "rssi" elsewhere in the document.
+static int jsonFindScope(const String &doc, const char *scopeKey) {
+  if (!scopeKey) return 0;
+  String k = String("\"") + scopeKey + "\":";
+  int at = doc.indexOf(k);
+  return at < 0 ? -1 : at + k.length();
+}
+
+static bool jsonInt(const String &doc, const char *key, long *out, const char *scopeKey = nullptr) {
+  int from = jsonFindScope(doc, scopeKey);
+  if (from < 0) return false;
+  String k = String("\"") + key + "\":";
+  int at = doc.indexOf(k, from);
+  if (at < 0) return false;
+  at += k.length();
+  while (at < (int)doc.length() && doc[at] == ' ') at++;
+  int end = at;
+  if (end < (int)doc.length() && (doc[end] == '-' || doc[end] == '+')) end++;
+  int digits = end;
+  while (end < (int)doc.length() && isdigit((unsigned char)doc[end])) end++;
+  if (end == digits) return false;                 // null / true / a string: not an int
+  *out = doc.substring(at, end).toInt();
+  return true;
+}
+
+static bool jsonStr(const String &doc, const char *key, char *out, size_t cap,
+                    const char *scopeKey = nullptr) {
+  int from = jsonFindScope(doc, scopeKey);
+  if (from < 0) return false;
+  String k = String("\"") + key + "\":\"";
+  int at = doc.indexOf(k, from);
+  if (at < 0) return false;
+  at += k.length();
+  int end = doc.indexOf('"', at);
+  if (end < 0) return false;
+  size_t n = (size_t)(end - at);
+  if (n >= cap) n = cap - 1;
+  memcpy(out, doc.c_str() + at, n);
+  out[n] = 0;
+  return true;
+}
+
+// True when the key is present AND not null — how leds.matrix signals a 2D device.
+static bool jsonPresentNotNull(const String &doc, const char *key) {
+  String k = String("\"") + key + "\":";
+  int at = doc.indexOf(k);
+  if (at < 0) return false;
+  at += k.length();
+  while (at < (int)doc.length() && doc[at] == ' ') at++;
+  return doc.indexOf("null", at) != at;
+}
+
+// --- the registry ---------------------------------------------------------------------------------
+static CoordDevice devices[COORD_MAX_DEVICES];
+
+static CoordDevice *deviceSlot(uint8_t host) {
+  for (uint8_t i = 0; i < COORD_MAX_DEVICES; i++)
+    if (devices[i].used && devices[i].host == host) return &devices[i];
+  for (uint8_t i = 0; i < COORD_MAX_DEVICES; i++)
+    if (!devices[i].used) { memset(&devices[i], 0, sizeof(devices[i])); devices[i].used = true; devices[i].host = host; return &devices[i]; }
+  return nullptr;   // full: keep what we have rather than evicting something still live
+}
+
+// Record everything we can learn about one device from the two documents we already fetch.
+static void registryNote(uint8_t host, const String &info, const String &state, uint32_t now) {
+  CoordDevice *d = deviceSlot(host);
+  if (!d) return;
+  jsonStr(info, "mac",  d->mac,  sizeof(d->mac));
+  jsonStr(info, "name", d->name, sizeof(d->name));
+  jsonStr(info, "ver",  d->ver,  sizeof(d->ver));
+  long v;
+  if (jsonInt(info, "count",  &v, "leds")) d->leds        = (uint16_t)v;
+  if (jsonInt(info, "rssi",   &v, "wifi")) d->apRssi      = (int8_t)v;
+  if (jsonInt(info, "signal", &v, "wifi")) d->apSignalPct = (uint8_t)v;
+  d->matrix = jsonPresentNotNull(info, "matrix");
+  if (jsonInt(state, "bri", &v)) d->bri = (uint8_t)v;
+  d->on = state.indexOf("\"on\":true") >= 0;
+  if (jsonInt(state, "fx",  &v)) d->fx  = (uint8_t)v;
+  if (jsonInt(state, "pal", &v)) d->pal = (uint8_t)v;
+  // col is [[r,g,b],...]; take the first triple.
+  int c = state.indexOf("\"col\":[[");
+  if (c >= 0) {
+    c += 8;
+    long rgb[3] = {0,0,0}; int idx = 0;
+    while (idx < 3 && c < (int)state.length()) {
+      while (c < (int)state.length() && (state[c] == ' ' || state[c] == ',')) c++;
+      int st2 = c;
+      while (c < (int)state.length() && isdigit((unsigned char)state[c])) c++;
+      if (c == st2) break;
+      rgb[idx++] = state.substring(st2, c).toInt();
+    }
+    d->r = (uint8_t)rgb[0]; d->g = (uint8_t)rgb[1]; d->b = (uint8_t)rgb[2];
+  }
+  d->lastSeenMs = now;
+}
+
+const CoordDevice *coordinatorDevices(uint8_t *countOut) {
+  if (countOut) {
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < COORD_MAX_DEVICES; i++) if (devices[i].used) n++;
+    *countOut = n;
+  }
+  return devices;
+}
+
+// --- discovery + fan-out -------------------------------------------------------------------------
+// Sweeps the home /24 for anything answering /json/info as WLED, then sets each one's colour.
+// Deliberately the same shape as the Mac-side wled_sync.py, which is this firmware's oracle.
+//
+// INCREMENTAL, and that is not an optimisation. A straight loop over 254 addresses at the push
+// timeout is up to ~17 minutes inside one loop() call, during which handleClient() never runs — so
+// /coordinator, /debug and POST /update all go dark and the device looks bricked. That is precisely
+// the failure just fixed in the router's beacon path, and it is just as easy to reintroduce here.
+// So the sweep advances a few addresses per pass and yields.
+#ifndef COORD_SWEEP_PER_PASS
+#define COORD_SWEEP_PER_PASS 6
+#endif
+// Discovery timeout is deliberately much shorter than the push timeout: a WLED device already on
+// the LAN answers /json/info in milliseconds, and 248 of the 254 addresses are silence we are
+// paying for. The push keeps the longer budget because a target mid-reboot legitimately stalls.
+#ifndef COORD_DISCOVER_TIMEOUT_MS
+// Measured, not guessed: at 500 ms a sweep found 2 of 4 devices that were demonstrably on the LAN
+// (the Mac-side wled_sync.py found all 4 at the same moment). WLED devices run WiFi power-save, so
+// a first response can take well over half a second even when the device is healthy. 1200 ms costs
+// ~30 s of extra worst-case sweep across a silent /24, which is free because the sweep yields.
+#define COORD_DISCOVER_TIMEOUT_MS 1200
+#endif
+
+static uint8_t  sweepHost   = 0;      // next address to probe; 0 = sweep not running
+static uint16_t sweepFound  = 0;
+static uint16_t sweepSet    = 0;
+
+static void sweepBegin() { sweepHost = 1; sweepFound = 0; sweepSet = 0; }
+
+// Returns true when the sweep has finished this pass over the subnet.
+static bool sweepStep() {
+  if (WiFi.status() != WL_CONNECTED) return true;
+  IPAddress me = WiFi.localIP();
+  char bodyBuf[WLED_TRANSLATE_MAX_BODY];
+  size_t n = wled_body_solid(target, COORD_TARGET_BRI, bodyBuf, sizeof(bodyBuf));
+  if (n == 0) { DEBUG_ERR("coord: colour body would not fit"); return true; }
+
+  for (int i = 0; i < COORD_SWEEP_PER_PASS && sweepHost <= 254; i++, sweepHost++) {
+    if (sweepHost == me[3]) continue;
+    char ip[16];
+    snprintf(ip, sizeof(ip), "%u.%u.%u.%u", me[0], me[1], me[2], sweepHost);
+    String info;
+    if (httpGetT(ip, "/json/info", &info, COORD_DISCOVER_TIMEOUT_MS) <= 0) continue;
+    if (info.indexOf("\"brand\":\"WLED\"") < 0) continue;
+    sweepFound++;
+    if (httpPost(ip, "/json/state", bodyBuf, nullptr) > 0) sweepSet++;
+    // Read the look back AFTER setting it, so the registry records what the device actually holds
+    // rather than what we asked for — the same assert-the-effect rule the tests follow.
+    String stateDoc;
+    if (httpGetT(ip, "/json/state", &stateDoc, COORD_DISCOVER_TIMEOUT_MS) > 0)
+      registryNote(sweepHost, info, stateDoc, millis());
+  }
+  if (sweepHost > 254) {
+    st.discovered = sweepFound;
+    st.synced     = sweepSet;
+    DEBUG1_VALUE("coord: sync found ", sweepFound);
+    DEBUG1_VALUELN(" set ", sweepSet);
+    return true;
+  }
+  return false;
+}
+
+// --- phases ---------------------------------------------------------------------------------------
+static void enter(Phase p, uint32_t now) { phase = p; phaseSince = now; st.phase = phaseName(p); }
+
+void coordinatorSetup() {
+  loadHome();
+  storeHome();                 // commit BEFORE any hop can happen
+  wled_pushlog_reset(&pushed);
+  st.phase = phaseName(PH_BOOT);
+  st.targetR = target.r; st.targetG = target.g; st.targetB = target.b;
+  DEBUG1_VALUELN("coord: home ssid=", homeSsid);
+  joinHome(20000);
+  enter(PH_SCAN, millis());
+}
+
+void coordinatorLoop(uint32_t now) {
+  switch (phase) {
+    case PH_SCAN: {
+      if (now - lastScanMs < COORD_SCAN_PERIOD_MS && lastScanMs != 0) { enter(PH_SYNC, now); break; }
+      lastScanMs = now;
+      int found = WiFi.scanNetworks(false, true);
+      int hopped = 0;
+      for (int i = 0; i < found; i++) {
+        WledScanResult r;
+        String ssid = WiFi.SSID(i);
+        r.ssid = ssid.c_str();
+        memcpy(r.bssid, WiFi.BSSID(i), 6);
+        r.rssi = (int8_t)WiFi.RSSI(i);
+        r.channel = (uint8_t)WiFi.channel(i);
+        if (wled_is_candidate(&r, &pushed) != WLED_CAND_YES) continue;
+        WiFi.scanDelete();
+        onboardOne(r);
+        hopped++;
+        break;                 // one hop per pass: re-scan after, the AP list has changed
+      }
+      if (!hopped) WiFi.scanDelete();
+      enter(hopped ? PH_SETTLE : PH_SYNC, now);
+      break;
+    }
+    case PH_SETTLE: {
+      // Return home and hold still so pushed devices can find the network.
+      if (WiFi.status() != WL_CONNECTED) joinHome(15000);
+      if (now - phaseSince >= COORD_SETTLE_MS) enter(PH_SYNC, now);
+      break;
+    }
+    case PH_SYNC: {
+      if (WiFi.status() != WL_CONNECTED) { joinHome(15000); break; }
+      if (sweepHost == 0) {                       // not sweeping: is one due?
+        if (lastSyncMs != 0 && now - lastSyncMs < COORD_SYNC_PERIOD_MS) { enter(PH_SCAN, now); break; }
+        lastSyncMs = now;
+        sweepBegin();
+      }
+      if (sweepStep()) {                          // finished this pass over the subnet
+        sweepHost = 0;
+        enter(PH_SCAN, now);
+      }
+      break;                                       // still sweeping: yield, keep HTTP alive
+    }
+    default: enter(PH_SCAN, now); break;
+  }
+}
+
+CoordinatorStatus coordinatorStatus() {
+  st.homeUp  = (WiFi.status() == WL_CONNECTED);
+  st.targetR = target.r; st.targetG = target.g; st.targetB = target.b;
+  return st;
+}
+
+void coordinatorSetTarget(uint8_t r, uint8_t g, uint8_t b) {
+  target.r = r; target.g = g; target.b = b;
+  lastSyncMs = 0;              // apply on the next pass rather than waiting out the period
+}
+
+#endif  // WLED_COORDINATOR_ROLE

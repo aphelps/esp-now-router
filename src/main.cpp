@@ -24,7 +24,10 @@
 #include "router_relay.h"           // router logic: ss_router_should_relay, SensorRouterPeer, RouterBeacon
 #include "router_election.h"        // pure leader-election state machine (host-tested)
 #include "attach.h"                 // attach protocol: router advertisements, membership, failover
-#include "ota.h"                    // WiFi bring-up + POST /update route (server owned here)
+#include "ota.h"
+#ifdef WLED_COORDINATOR_ROLE
+#include "coordinator.h"          // scan/join/push + discover/fan-out (radio glue)
+#endif                    // WiFi bring-up + POST /update route (server owned here)
 
 #ifndef ROUTER_ESPNOW_CHANNEL
 #define ROUTER_ESPNOW_CHANNEL 1
@@ -91,9 +94,43 @@ static uint32_t deriveDeviceId() {
 
 // QuickEspNow RX callback — runs on QuickEspNow's dedicated task, NOT loop(). Keep it minimal:
 // claim only our frames and hand them to the SPSC ring; all relay logic runs on loop().
+// Per-origin RSSI of the last frame we heard directly, keyed by the sender's deviceId.
+//
+// This is the DEVICE-TO-DEVICE measurement, and it is the one worth having: /json/info's wifi.rssi
+// is a device's signal to the ACCESS POINT, which places devices on a sphere around the router and
+// says nothing about how far they are from each other. ESP-NOW frames arrive with the RSSI of the
+// direct radio path between the two nodes, which is what a relative-position estimate actually
+// needs. It was being discarded — the callback has always been handed it.
+//
+// Written from the ESP-NOW RX task and read by the HTTP handler on the Arduino task. Single writer,
+// and each field is word-sized and independently meaningful, so a torn read costs at worst one
+// stale sample of a value that is noisy by nature — not worth a lock in an interrupt-adjacent path.
+struct OriginSignal { uint32_t deviceId; int32_t rssi; uint32_t lastMs; bool used; };
+static volatile OriginSignal originSignal[ROUTER_MAX_ORIGINS];
+
+static void noteOriginSignal(uint32_t id, int32_t rssi, uint32_t now) {
+  for (int i = 0; i < ROUTER_MAX_ORIGINS; i++) {
+    if (originSignal[i].used && originSignal[i].deviceId == id) {
+      originSignal[i].rssi = rssi; originSignal[i].lastMs = now; return;
+    }
+  }
+  for (int i = 0; i < ROUTER_MAX_ORIGINS; i++) {
+    if (!originSignal[i].used) {
+      originSignal[i].used = true; originSignal[i].deviceId = id;
+      originSignal[i].rssi = rssi; originSignal[i].lastMs = now; return;
+    }
+  }
+}
+
 static void onEspNowRx(uint8_t *mac, uint8_t *data, uint8_t len, signed int rssi, bool broadcast) {
-  (void)mac; (void)rssi; (void)broadcast;
-  if (ss_is_our_frame(data, (int)len)) rxRing.push(data, (int)len);
+  (void)mac; (void)broadcast;
+  if (!ss_is_our_frame(data, (int)len)) return;
+  if (len >= (int)sizeof(SensorSyncHeader)) {
+    SensorSyncHeader h;
+    memcpy(&h, data, sizeof(h));
+    noteOriginSignal(h.deviceId, (int32_t)rssi, millis());
+  }
+  rxRing.push(data, (int)len);
 }
 
 // Record that peer router `id` was heard now: refresh its slot, or take a free one (full -> drop).
@@ -169,7 +206,33 @@ static void handleRoutes() {
     if (!relayTbl[i].used) continue;
     if (!first) j += ",";
     first = false;
-    j += "{\"id\":\"" + String(relayTbl[i].deviceId, HEX) + "\",\"lastSeq\":" + String(relayTbl[i].lastSeq) + "}";
+    j += "{\"id\":\"" + String(relayTbl[i].deviceId, HEX) + "\",\"lastSeq\":" + String(relayTbl[i].lastSeq);
+    for (int k = 0; k < ROUTER_MAX_ORIGINS; k++) {
+      if (originSignal[k].used && originSignal[k].deviceId == relayTbl[i].deviceId) {
+        // rssiDirect: this node's radio path to that origin. NOT the same thing as the device's own
+        // wifi.rssi, which is its path to the AP.
+        j += ",\"rssiDirect\":" + String((int)originSignal[k].rssi);
+        j += ",\"heardMsAgo\":" + String(now - originSignal[k].lastMs);
+        break;
+      }
+    }
+    j += "}";
+  }
+  j += "],\"heard\":[";
+  // Every origin we have heard DIRECTLY, whether or not it ever reached the relay table. Kept
+  // separate from "origins" on purpose: a node can be audible and still never relay (wrong msgType,
+  // deduped, TTL spent), and for distance estimation "did we hear it, and how strongly" is the
+  // question — not "did we forward it".
+  {
+    bool f2 = true;
+    for (int i = 0; i < ROUTER_MAX_ORIGINS; i++) {
+      if (!originSignal[i].used) continue;
+      if (!f2) j += ",";
+      f2 = false;
+      j += "{\"id\":\"" + String((uint32_t)originSignal[i].deviceId, HEX) + "\"";
+      j += ",\"rssiDirect\":" + String((int)originSignal[i].rssi);
+      j += ",\"heardMsAgo\":" + String(now - (uint32_t)originSignal[i].lastMs) + "}";
+    }
   }
   j += "],\"routers\":[";
   first = true;
@@ -241,7 +304,7 @@ void setup() {
   // channel to WiFi", which is the same rule WLED's own ESP-NOW follows once joined, so edges and
   // routers converge without coordination. ROUTER_ESPNOW_CHANNEL keeps its meaning for the no-infra
   // case (SoftAP / standalone mesh), where nothing else defines a channel.
-  const bool haveInfraCreds = (ROUTER_WIFI_SSID[0] != '\0');
+  const bool haveInfraCreds = otaHaveInfraCreds();
   quickEspNow.begin(haveInfraCreds ? CURRENT_WIFI_CHANNEL : ROUTER_ESPNOW_CHANNEL,
                     0, /*synchronousSend=*/false);
   followWifiChannel = haveInfraCreds;
@@ -253,9 +316,38 @@ void setup() {
   httpServer.on("/info", HTTP_GET, handleInfo);
   httpServer.on("/routes", HTTP_GET, handleRoutes);
   httpServer.on("/debug", HTTP_GET, handleDebug);
+#ifdef WLED_COORDINATOR_ROLE
+  httpServer.on("/coordinator", HTTP_GET, [](){
+    CoordinatorStatus c = coordinatorStatus();
+    String j = "{";
+    j += "\"phase\":\"" + String(c.phase) + "\",";
+    j += "\"target\":[" + String(c.targetR) + "," + String(c.targetG) + "," + String(c.targetB) + "],";
+    j += "\"onboarded\":" + String(c.onboarded) + ",";
+    j += "\"discovered\":" + String(c.discovered) + ",";
+    j += "\"synced\":" + String(c.synced) + ",";
+    j += "\"hops\":" + String(c.hops) + ",";
+    j += "\"hopFailures\":" + String(c.hopFailures) + ",";
+    j += "\"homeUp\":" + String(c.homeUp ? "true" : "false");
+    j += "}";
+    httpServer.send(200, "application/json", j);
+  });
+  // Set the colour the fleet is driven to. Query args rather than a JSON body so it is one curl.
+  httpServer.on("/target", HTTP_POST, [](){
+    long r = httpServer.arg("r").toInt(), g = httpServer.arg("g").toInt(), b = httpServer.arg("b").toInt();
+    if (r < 0 || r > 255 || g < 0 || g > 255 || b < 0 || b > 255) {
+      httpServer.send(400, "application/json", "{\"error\":\"r,g,b must each be 0-255\"}");
+      return;
+    }
+    coordinatorSetTarget((uint8_t)r, (uint8_t)g, (uint8_t)b);
+    httpServer.send(200, "application/json", "{\"ok\":true}");
+  });
+#endif
   otaRegisterUpdate(httpServer);   // POST /update
   httpServer.begin();
 
+#ifdef WLED_COORDINATOR_ROLE
+  coordinatorSetup();
+#endif
   DEBUG1_PRINT("esp-now-router up id=0x");
   DEBUG1_HEX(selfId);
   DEBUG1_VALUELN(" channel=", ROUTER_ESPNOW_CHANNEL);
@@ -338,6 +430,9 @@ void loop() {
   // Before anything radio-dependent: if we have associated (or roamed) onto a different channel,
   // follow it. Cheap — gated to once per ROUTER_CHANNEL_CHECK_MS.
   reconcileEspNowChannel(now);
+#ifdef WLED_COORDINATOR_ROLE
+  coordinatorLoop(now);
+#endif
   httpServer.handleClient();   // service the HTTP endpoints (/update, /info, /routes, /debug)
 
   // 1. Drain the RX ring: relay SNAPSHOT frames; feed BEACON frames to the election (never relay

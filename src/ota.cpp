@@ -97,6 +97,10 @@ void otaRegisterUpdate(WebServer &s) {
   s.on("/update", HTTP_POST, handleUpdateResult, handleUpdateUpload);
 }
 
+bool otaHaveInfraCreds() {
+  return ROUTER_WIFI_SSID[0] != '\0';
+}
+
 bool otaWifiUp() {
   return haveCreds && WiFi.status() == WL_CONNECTED;
 }

@@ -8,3 +8,6 @@
 void otaWifiBegin();                    // WiFi-STA (build-flag creds) or fallback SoftAP; + mark-valid
 void otaRegisterUpdate(WebServer &s);   // register the POST /update route on the caller's server
 bool otaWifiUp();                       // true once associated to infra WiFi (STA) — false in AP mode
+// True when infra credentials were built in, i.e. the AP owns the channel and ESP-NOW must follow
+// it rather than pin one. The creds themselves stay private to ota.cpp.
+bool otaHaveInfraCreds();
