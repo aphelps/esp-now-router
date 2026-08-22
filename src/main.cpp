@@ -328,6 +328,13 @@ void setup() {
     j += "\"hops\":" + String(c.hops) + ",";
     j += "\"hopFailures\":" + String(c.hopFailures) + ",";
     j += "\"homeUp\":" + String(c.homeUp ? "true" : "false");
+    // selfHost is the single address the sweep skips. Exposed because a wrong value here silently
+    // removes exactly one device from discovery, which is indistinguishable from that device being
+    // offline unless you can see the number.
+    j += ",\"selfHost\":" + String(c.selfHost);
+    j += ",\"sweepAt\":" + String(c.sweepAt);
+    j += ",\"sweepFoundNow\":" + String(c.sweepFoundNow);
+    j += ",\"retryHits\":" + String(c.retryHits);
     j += "}";
     httpServer.send(200, "application/json", j);
   });

@@ -29,6 +29,11 @@ struct CoordinatorStatus {
   uint32_t    hops;          // AP hops attempted
   uint32_t    hopFailures;
   bool        homeUp;
+  uint8_t     selfHost;      // our own last octet — the ONE address the sweep skips
+  uint8_t     sweepAt;       // sweep cursor, 0 when not sweeping
+  uint16_t    retryHits;     // devices that were found ONLY because the probe was retried
+  uint16_t    sweepFoundNow; // devices found so far in the CURRENT pass (discovered only publishes
+                             // at the end, which hides where a sweep is losing devices)
 };
 CoordinatorStatus coordinatorStatus();
 

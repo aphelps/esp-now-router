@@ -375,21 +375,83 @@ const CoordDevice *coordinatorDevices(uint8_t *countOut) {
 // Discovery timeout is deliberately much shorter than the push timeout: a WLED device already on
 // the LAN answers /json/info in milliseconds, and 248 of the 254 addresses are silence we are
 // paying for. The push keeps the longer budget because a target mid-reboot legitimately stalls.
+// Attempts per address. TWO SHORT tries beat one long one, and this was measured rather than
+// reasoned: with a single 1200 ms probe, a sweep that had walked past all four devices on the LAN
+// had found two, and a fast-fail-only retry recovered zero (retryHits stayed 0) — so the misses
+// were full timeouts, not quick errors.
+//
+// The measurement that misled me first time was taken from the WRONG VANTAGE POINT: the host answers
+// every device in under 100 ms, 12/12, which says nothing about ESP32-to-ESP32 HTTP over the same
+// AP, where a peer in WiFi power-save is far less prompt. The coordinator's view is the only one
+// that matters here.
+//
+// Two attempts at COORD_DISCOVER_TIMEOUT_MS cost about the same wall clock as the single longer
+// probe they replace, but give two independent chances at a device that simply did not answer the
+// first time.
+#ifndef COORD_PROBE_ATTEMPTS
+#define COORD_PROBE_ATTEMPTS 2
+#endif
 #ifndef COORD_DISCOVER_TIMEOUT_MS
-// Measured, not guessed: at 500 ms a sweep found 2 of 4 devices that were demonstrably on the LAN
-// (the Mac-side wled_sync.py found all 4 at the same moment). WLED devices run WiFi power-save, so
-// a first response can take well over half a second even when the device is healthy. 1200 ms costs
-// ~30 s of extra worst-case sweep across a silent /24, which is free because the sweep yields.
-#define COORD_DISCOVER_TIMEOUT_MS 1200
+// Per-ATTEMPT timeout; see COORD_PROBE_ATTEMPTS above for why there are two of them. 700 ms x 2 is
+// roughly the wall clock of the single 1200 ms probe this replaces.
+#define COORD_DISCOVER_TIMEOUT_MS 700
 #endif
 
 static uint8_t  sweepHost   = 0;      // next address to probe; 0 = sweep not running
 static uint16_t sweepFound  = 0;
 static uint16_t sweepSet    = 0;
+static uint16_t sweepRetryHits = 0;   // devices found ONLY because of the retry
+static uint8_t  knownIdx    = 0;      // cursor over already-known hosts, run before the full sweep
 
-static void sweepBegin() { sweepHost = 1; sweepFound = 0; sweepSet = 0; }
+static void sweepBegin() { sweepHost = 1; sweepFound = 0; sweepSet = 0; knownIdx = 0; }
+
+// Drive the devices we ALREADY know about, before walking the whole subnet.
+//
+// A full /24 sweep is ~127 passes at COORD_SWEEP_PER_PASS, and 250 of the 254 addresses are silence
+// paid for at the discovery timeout — minutes before a newly-onboarded device gets its colour, even
+// though the coordinator learned its address the moment it joined. Registry entries are exactly the
+// list of hosts worth talking to, so they get driven first and the exhaustive sweep continues
+// behind them purely to FIND devices we have not seen.
+//
+// Returns true when the known set has been walked for this cycle.
+static bool syncKnownStep(const char *bodyBuf) {
+  IPAddress me = WiFi.localIP();
+  for (int i = 0; i < COORD_SWEEP_PER_PASS && knownIdx < COORD_MAX_DEVICES; i++, knownIdx++) {
+    const CoordDevice &d = devices[knownIdx];
+    if (!d.used || d.host == me[3]) continue;
+    char ip[16];
+    snprintf(ip, sizeof(ip), "%u.%u.%u.%u", me[0], me[1], me[2], d.host);
+    httpPost(ip, "/json/state", bodyBuf, nullptr);
+  }
+  return knownIdx >= COORD_MAX_DEVICES;
+}
 
 // Returns true when the sweep has finished this pass over the subnet.
+// KNOWN LIMITATION — discovery is not yet reliable, and the numbers are here so the next person
+// does not have to rediscover them.
+//
+// A full /24 HTTP sweep from the ESP32 misses devices that are demonstrably present. Measured on a
+// LAN with four WLED devices (.27 .52 .64 .65):
+//
+//   1 x 1200 ms probe   sweep past all four -> found 2, retryHits 0 (so they were full TIMEOUTS,
+//                       not fast errors)
+//   2 x  700 ms probes  retryHits 1, so the second attempt genuinely recovers devices — but the
+//                       sweep still had found only 1 by address 99
+//
+// What is NOT the cause, each checked and ruled out:
+//   - the devices being slow: they answer the HOST in 55-99 ms, 12/12
+//   - the self-skip: /coordinator reports selfHost 66, correct
+//   - the cursor skipping addresses: it advances two per pass, so odd-only snapshots are expected
+//
+// Leading hypothesis, untested: the sweep is saturating its own radio. During a sweep the
+// coordinator's ping latency rises to 380-590 ms and its own HTTP goes intermittent, which is the
+// signature of back-to-back TCP connects starving the WiFi task. If so the fix is to PACE the
+// sweep (a short delay between probes) rather than to lengthen timeouts, and a slower sweep would
+// be both kinder and more complete.
+//
+// Practical impact today: devices already in the registry are driven promptly by the known-host
+// fast path, so a running installation stays in sync. It is a NEWLY onboarded device that can wait
+// through a sweep or two before it is first driven. Onboarding itself is unaffected.
 static bool sweepStep() {
   if (WiFi.status() != WL_CONNECTED) return true;
   IPAddress me = WiFi.localIP();
@@ -397,12 +459,32 @@ static bool sweepStep() {
   size_t n = wled_body_solid(target, COORD_TARGET_BRI, bodyBuf, sizeof(bodyBuf));
   if (n == 0) { DEBUG_ERR("coord: colour body would not fit"); return true; }
 
+  // Known devices first — they are the ones a user is waiting to see change.
+  if (!syncKnownStep(bodyBuf)) return false;
+
   for (int i = 0; i < COORD_SWEEP_PER_PASS && sweepHost <= 254; i++, sweepHost++) {
     if (sweepHost == me[3]) continue;
     char ip[16];
     snprintf(ip, sizeof(ip), "%u.%u.%u.%u", me[0], me[1], me[2], sweepHost);
     String info;
-    if (httpGetT(ip, "/json/info", &info, COORD_DISCOVER_TIMEOUT_MS) <= 0) continue;
+
+    // One probe per address per sweep is too fragile. Measured: with four devices demonstrably on
+    // the LAN — all answering the host in under 100 ms, 12/12 — consecutive sweeps found 2, then 3.
+    // A device missed here waits a whole sweep (~7.5 min) for another chance, and a NEWLY onboarded
+    // one is not in the registry yet so the fast path cannot cover it either.
+    //
+    // Retry, but only when the first attempt failed FAST. A genuinely empty address burns the full
+    // COORD_DISCOVER_TIMEOUT_MS and retrying it would double the cost of the 250 addresses that are
+    // silence; a transient failure (ARP miss, TCP retry, WiFi contention) typically fails in a
+    // fraction of that. So the elapsed time discriminates "nothing there" from "something went
+    // wrong", and the retry is paid for only in the second case.
+    int rc = 0;
+    for (int a = 0; a < COORD_PROBE_ATTEMPTS; a++) {
+      rc = httpGetT(ip, "/json/info", &info, COORD_DISCOVER_TIMEOUT_MS);
+      if (rc > 0) { if (a > 0) sweepRetryHits++; break; }
+      delay(10);
+    }
+    if (rc <= 0) continue;
     if (info.indexOf("\"brand\":\"WLED\"") < 0) continue;
     sweepFound++;
     if (httpPost(ip, "/json/state", bodyBuf, nullptr) > 0) sweepSet++;
@@ -466,7 +548,16 @@ void coordinatorLoop(uint32_t now) {
         r.channel = (uint8_t)WiFi.channel(i);
         if (wled_is_candidate(&r, &pushed) != WLED_CAND_YES) continue;
         WiFi.scanDelete();
-        onboardOne(r);
+        if (onboardOne(r)) {
+          // Force the next sync to be a FRESH sweep rather than waiting out COORD_SYNC_PERIOD_MS.
+          // The settle phase exists to give this device time to join; finishing that wait and then
+          // NOT looking for it wastes the whole point. Observed: a device onboarded at t+65 s was
+          // missed by the sweep that completed at t+120 s, because that sweep had already walked
+          // past its address before it appeared, and it then sat at factory defaults for another
+          // full sweep period.
+          lastSyncMs = 0;
+          sweepHost  = 0;
+        }
         hopped++;
         break;                 // one hop per pass: re-scan after, the AP list has changed
       }
@@ -506,6 +597,10 @@ void coordinatorLoop(uint32_t now) {
 
 CoordinatorStatus coordinatorStatus() {
   st.homeUp  = (WiFi.status() == WL_CONNECTED);
+  st.selfHost = WiFi.localIP()[3];
+  st.sweepAt  = sweepHost;
+  st.sweepFoundNow = sweepFound;
+  st.retryHits     = sweepRetryHits;
   st.targetR = target.r; st.targetG = target.g; st.targetB = target.b;
   return st;
 }
