@@ -365,7 +365,12 @@ const CoordDevice *coordinatorDevices(uint8_t *countOut) {
 // the failure just fixed in the router's beacon path, and it is just as easy to reintroduce here.
 // So the sweep advances a few addresses per pass and yields.
 #ifndef COORD_SWEEP_PER_PASS
-#define COORD_SWEEP_PER_PASS 6
+// Two, not six. This bounds how long ONE loop() pass can be stuck in synchronous HTTP: each probe
+// costs up to COORD_DISCOVER_TIMEOUT_MS against a silent address, and 6 x 1200 ms is 7.2 s during
+// which handleClient() does not run and the device looks dead to anything talking HTTP. Measured:
+// at 6 per pass, 3 of 12 status polls timed out; the sweep is background work and must never be
+// the reason an OTA or a status request fails.
+#define COORD_SWEEP_PER_PASS 2
 #endif
 // Discovery timeout is deliberately much shorter than the push timeout: a WLED device already on
 // the LAN answers /json/info in milliseconds, and 248 of the 254 addresses are silence we are
@@ -436,8 +441,21 @@ void coordinatorLoop(uint32_t now) {
   switch (phase) {
     case PH_SCAN: {
       if (now - lastScanMs < COORD_SCAN_PERIOD_MS && lastScanMs != 0) { enter(PH_SYNC, now); break; }
+
+      // ASYNCHRONOUS scan. A blocking WiFi.scanNetworks() takes seconds and stalls loop(), so
+      // handleClient() does not run and every HTTP endpoint — including POST /update — goes dead
+      // for the duration, every COORD_SCAN_PERIOD_MS. Observed directly: with no candidate APs in
+      // range and hops=0, /coordinator answered on alternating polls and a 600 kB OTA upload could
+      // not complete. That is the same failure as the router's synchronous ESP-NOW send and as the
+      // original blocking discovery sweep: a long call in loop() is indistinguishable from a dead
+      // device to anything talking HTTP.
+      int found = WiFi.scanComplete();
+      if (found == WIFI_SCAN_RUNNING) break;             // still scanning: yield, stay responsive
+      if (found == WIFI_SCAN_FAILED) {                   // not started yet (or the last one failed)
+        WiFi.scanNetworks(/*async=*/true, /*show_hidden=*/true);
+        break;
+      }
       lastScanMs = now;
-      int found = WiFi.scanNetworks(false, true);
       int hopped = 0;
       for (int i = 0; i < found; i++) {
         WledScanResult r;
@@ -472,7 +490,14 @@ void coordinatorLoop(uint32_t now) {
       if (sweepStep()) {                          // finished this pass over the subnet
         sweepHost = 0;
         enter(PH_SCAN, now);
+        break;
       }
+      // A sweep must not delay ONBOARDING. Discovery walks 254 addresses, most of them silent, at
+      // COORD_DISCOVER_TIMEOUT_MS each — minutes of wall clock. Scanning only between completed
+      // sweeps meant a factory-fresh device sat in AP mode that whole time (observed: hops=0 with a
+      // waiting target). So a due scan preempts the sweep; sweepHost is left where it is and the
+      // sweep resumes on the next pass through PH_SYNC rather than restarting.
+      if (now - lastScanMs >= COORD_SCAN_PERIOD_MS) enter(PH_SCAN, now);
       break;                                       // still sweeping: yield, keep HTTP alive
     }
     default: enter(PH_SCAN, now); break;
