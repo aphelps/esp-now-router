@@ -9,6 +9,7 @@
 #include <Preferences.h>
 #include <Debug.h>
 
+#include "coordinator_mode.h"   // mode gate + target blacklist (was compile-checked but unlinked)
 #include "wled_candidate.h"
 #include "wled_onboard_cfg.h"
 #include "wled_translate.h"
@@ -61,6 +62,19 @@ static const char *phaseName(Phase p) {
     case PH_SETTLE: return "settle";
     default:        return "sync";
   }
+}
+
+// Policy state. Until now coordinator_mode.h was compiled (coordinator_compile_check.cpp) and
+// host-tested but never linked into the runtime, so none of it was enforced: a target that could
+// never be completed was retried forever. Measured 2026-08-22: hops=7 hopFailures=7 against one
+// candidate, still going, each attempt costing a scan, an association attempt and a full settle.
+static coord_state_t cstate;
+
+// The blacklist and the push log are both keyed on BSSID so the two can be reasoned about together.
+static uint64_t bssidKey(const uint8_t *b) {
+  uint64_t k = 0;
+  for (int i = 0; i < 6; i++) k = (k << 8) | b[i];
+  return k;
 }
 
 static Phase       phase        = PH_BOOT;
@@ -552,6 +566,7 @@ void coordinatorSetup() {
   loadHome();
   storeHome();                 // commit BEFORE any hop can happen
   wled_pushlog_reset(&pushed);
+  coord_init(&cstate, COORD_HOP_BUDGET_MS);
   st.phase = phaseName(PH_BOOT);
   st.targetR = target.r; st.targetG = target.g; st.targetB = target.b;
   DEBUG1_VALUELN("coord: home ssid=", homeSsid);
@@ -560,6 +575,7 @@ void coordinatorSetup() {
 }
 
 void coordinatorLoop(uint32_t now) {
+  st.mode = (uint8_t)cstate.mode;      // publish policy state every pass, not only when it changes
   switch (phase) {
     case PH_SCAN: {
       if (now - lastScanMs < COORD_SCAN_PERIOD_MS && lastScanMs != 0) { enter(PH_SYNC, now); break; }
@@ -587,8 +603,37 @@ void coordinatorLoop(uint32_t now) {
         r.rssi = (int8_t)WiFi.RSSI(i);
         r.channel = (uint8_t)WiFi.channel(i);
         if (wled_is_candidate(&r, &pushed) != WLED_CAND_YES) continue;
+
+        // Policy gate. Refusals are REPORTED, not folded into a silent skip: "it just did not
+        // onboard" is precisely the failure this is meant to make diagnosable from the outside.
+        const uint64_t key = bssidKey(r.bssid);
+        const coord_hop_verdict_t verdict = coord_may_hop(&cstate, key);
+        if (verdict != COORD_HOP_PERMIT) {
+          st.lastRefusal = (uint8_t)verdict;
+          DEBUG1_VALUELN("coord: hop refused, verdict=", (int)verdict);
+          continue;                      // try the next candidate, do not burn the pass
+        }
+
         WiFi.scanDelete();
-        if (onboardOne(r)) {
+        coord_hop_begin(&cstate, key, millis());
+        const bool onboarded = onboardOne(r);
+        coord_hop_end(&cstate);
+
+        // A target that failed is retired rather than retried forever. Note the asymmetry this
+        // fixes: the push log retires targets that SUCCEED and never those that FAIL, which is
+        // backwards for duty cycle -- the successes are the ones worth revisiting.
+        if (!onboarded) {
+          if (!coord_blacklist_add(&cstate, key)) {
+            // Full is reported, not ignored: wedging on COORD_MAX_BLACKLIST distinct targets is a
+            // situation nobody designed for, and quietly resuming the retry loop hides it.
+            st.blacklistFull = true;
+            DEBUG_ERR("coord: blacklist FULL — a 9th failing target will be retried forever");
+          }
+          DEBUG1_VALUELN("coord: target blacklisted after failed hop, len=", cstate.blacklist_len);
+        }
+        st.blacklisted = cstate.blacklist_len;
+
+        if (onboarded) {
           // Force the next sync to be a FRESH sweep rather than waiting out COORD_SYNC_PERIOD_MS.
           // The settle phase exists to give this device time to join; finishing that wait and then
           // NOT looking for it wastes the whole point. Observed: a device onboarded at t+65 s was

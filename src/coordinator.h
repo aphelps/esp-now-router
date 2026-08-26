@@ -34,6 +34,14 @@ struct CoordinatorStatus {
   uint16_t    retryHits;     // devices that were found ONLY because the probe was retried
   uint16_t    sweepFoundNow; // devices found so far in the CURRENT pass (discovered only publishes
                              // at the end, which hides where a sweep is losing devices)
+
+  // Policy visibility. Without these a refused or failed hop is a bare number with no attribution:
+  // one bench session logged hops=7 hopFailures=7 with no way to tell which device or why, which is
+  // exactly what made it undiagnosable from outside the device.
+  uint8_t     mode;          // coord_mode_t: 0 = onboard (hopping allowed), 1 = operate (forbidden)
+  uint8_t     lastRefusal;   // coord_hop_verdict_t of the most recent refusal, 0 if none
+  uint8_t     blacklisted;   // targets retired after a failed hop
+  bool        blacklistFull; // COORD_MAX_BLACKLIST reached — a further failure cannot be retired
 };
 CoordinatorStatus coordinatorStatus();
 
