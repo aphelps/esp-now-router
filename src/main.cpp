@@ -23,6 +23,7 @@
 #include "sensor_sync_ring.h"       // SpscByteRing (lock-free SPSC, same as the edge RX ring)
 #include "router_relay.h"           // router logic: ss_router_should_relay, SensorRouterPeer, RouterBeacon
 #include "router_election.h"        // pure leader-election state machine (host-tested)
+#include "espnow_start.h"          // espnow_should_start: the start decision, host-tested
 #include "attach.h"                 // attach protocol: router advertisements, membership, failover
 #include "ota.h"
 #ifdef WLED_COORDINATOR_ROLE
@@ -60,12 +61,7 @@ static WebServer httpServer(80);   // top-level HTTP server; ota.cpp registers /
 // Live ESP-NOW channel state. Declared here because /info reports it — the whole point of the fix
 // below is that the LIVE channel and the build-time default can differ.
 static uint8_t  espnowChannel    = ROUTER_ESPNOW_CHANNEL;  // what the radio is actually on
-static bool     espnowStarted    = false;  // quickEspNow.begin() has run (see startEspNowWhenReady)
-#ifndef ROUTER_ESPNOW_JOIN_GRACE_MS
-// How long to wait for the STA to associate before starting ESP-NOW anyway. Bounded so a router
-// whose AP is absent still forms a standalone mesh instead of staying mute forever.
-#define ROUTER_ESPNOW_JOIN_GRACE_MS 20000
-#endif
+static bool     espnowStarted    = false;  // quickEspNow.begin() has run; see startEspNowWhenReady
 static uint32_t lastChannelChkMs = 0;
 static uint32_t channelFollows   = 0;                      // times we have had to follow the AP
 static bool     followWifiChannel = false;                 // true when infra WiFi owns the channel
@@ -269,6 +265,9 @@ static void handleDebug() {
   j += "\"freeHeap\":" + String(ESP.getFreeHeap()) + ",";
   j += "\"espnowChannel\":" + String(espnowChannel) + ",";
   j += "\"channelFollows\":" + String(channelFollows) + ",";
+  j += "\"espnowStarted\":" + String(espnowStarted ? 1 : 0) + ",";
+  j += "\"espnowSendFails\":" + String(attachSendFails()) + ",";
+  j += "\"espnowLastSendRc\":" + String(attachLastSendRc()) + ",";
   j += "\"staWifiUp\":" + String(otaWifiUp() ? "true" : "false");
   j += "}";
   httpServer.send(200, "application/json", j);
@@ -312,24 +311,22 @@ void setup() {
   // case (SoftAP / standalone mesh), where nothing else defines a channel.
   //
   // ORDER MATTERS, and getting it wrong is silent. begin(CURRENT_WIFI_CHANNEL) does NOT mean
-  // "track the STA": QuickEspNow resolves it ONCE via esp_wifi_get_channel() and then PINS it with
-  // setChannel() (QuickEspNow_esp32.cpp:37-44). Called here — before otaWifiBegin() has associated
-  // — it pins the BOOT channel. The STA then joins the AP on a different one, the ESP-NOW TX
-  // confirm callback stops arriving, and every send returns -3 (COMMS_SEND_QUEUE_FULL_ERROR) once
-  // the queue backs up. Measured on the bench 2026-08-27 against Lightbringer (AP on ch 2, router
-  // pinned to ch 1): 100% of adverts failed, continuously, while the beacon path — which never
-  // checks its return value — hid it. Re-pinning later does not work either: setChannel() fails
-  // while associated, exactly as reconcileEspNowChannel() documents (verified: "follow setChannel
-  // failed", 172/172 adverts still lost). So the only fix is to start ESP-NOW AFTER association.
+  // "track the STA": QuickEspNow resolves the channel ONCE via esp_wifi_get_channel() and PINS it
+  // with setChannel() (QuickEspNow_esp32.cpp:37-44). Run here — before otaWifiBegin() has
+  // associated — it pins the BOOT channel; the STA then joins the AP on another one, the TX confirm
+  // callback stops arriving, and every send returns -3 (COMMS_SEND_QUEUE_FULL_ERROR) once the queue
+  // backs up. Bench 2026-08-27 (AP ch 2, router pinned ch 1): 100% of adverts lost, continuously,
+  // hidden because the beacon path never checks its return value.
+  //
+  // So with infra credentials the start is DEFERRED to startEspNowWhenReady() in loop(). Boot stays
+  // non-blocking and HTTP keeps serving while the association lands.
   const bool haveInfraCreds = otaHaveInfraCreds();
   followWifiChannel = haveInfraCreds;
   espnowChannel     = haveInfraCreds ? 0 : ROUTER_ESPNOW_CHANNEL;   // 0 = "not known yet"
-  if (!haveInfraCreds) {
-    // Standalone: nothing else owns the channel, so start immediately.
+  if (espnow_should_start(haveInfraCreds, /*connected=*/false, espnowStarted)) {
     quickEspNow.begin(ROUTER_ESPNOW_CHANNEL, 0, /*synchronousSend=*/false);
     espnowStarted = true;
   }
-  // Infra: deferred to startEspNowWhenReady() in loop(), so boot stays non-blocking.
 
   // Top-level web server: WiFi bring-up (ota), then register all routes here and start it.
   otaWifiBegin();
@@ -422,18 +419,15 @@ void setup() {
 
 static uint32_t lastBeaconMs = 0;
 
-// Start ESP-NOW once the STA has associated, so begin(CURRENT_WIFI_CHANNEL) resolves and pins the
-// AP's channel rather than the boot channel. Non-blocking: loop() keeps serving HTTP meanwhile.
-static void startEspNowWhenReady(uint32_t now) {
-  if (espnowStarted) return;
-  const bool connected = (WiFi.status() == WL_CONNECTED);
-  if (!connected && now < ROUTER_ESPNOW_JOIN_GRACE_MS) return;   // still waiting; keep trying
-  quickEspNow.begin(connected ? CURRENT_WIFI_CHANNEL : ROUTER_ESPNOW_CHANNEL,
-                    0, /*synchronousSend=*/false);
-  espnowChannel = connected ? (uint8_t)WiFi.channel() : ROUTER_ESPNOW_CHANNEL;
+// Start ESP-NOW once the STA has associated, so begin(CURRENT_WIFI_CHANNEL) resolves the AP's
+// channel rather than the boot channel. Non-blocking: loop() keeps serving HTTP meanwhile, and the
+// radio half of loop() is skipped until this has run (quickEspNow's tx queue does not exist yet).
+static void startEspNowWhenReady() {
+  if (!espnow_should_start(otaHaveInfraCreds(), WiFi.status() == WL_CONNECTED, espnowStarted)) return;
+  quickEspNow.begin(CURRENT_WIFI_CHANNEL, 0, /*synchronousSend=*/false);
+  espnowChannel = (uint8_t)WiFi.channel();
   espnowStarted = true;
-  DEBUG1_VALUE("espnow: started, associated=", (int)connected);
-  DEBUG1_VALUELN(" channel=", (int)espnowChannel);
+  DEBUG1_VALUELN("espnow: started on AP channel ", (int)espnowChannel);
 }
 
 // --- ESP-NOW channel must FOLLOW the WiFi association -------------------------------------------
@@ -454,7 +448,6 @@ static void startEspNowWhenReady(uint32_t now) {
 // Note this makes the mesh channel a property of the AP, which is the same rule WLED's own ESP-NOW
 // follows once joined — so edges and routers converge on one channel without coordination.
 static void reconcileEspNowChannel(uint32_t now) {
-  if (!espnowStarted) return;   // nothing to reconcile until the radio is up
   if (now - lastChannelChkMs < ROUTER_CHANNEL_CHECK_MS) return;
   lastChannelChkMs = now;
 #ifdef ROUTER_CHANNEL_DIAG
@@ -477,6 +470,9 @@ static void reconcileEspNowChannel(uint32_t now) {
   // channel the scan is currently sitting on, not the AP's. Acting on it makes the coordinator
   // "follow" a walk through channels 2, 8, 12, 14 — observed on the bench — and in standalone mode
   // would actively drag the radio around with setChannel().
+  // Deliberately AFTER the diag block above: the deferred window is exactly when "why has
+  // ESP-NOW not started yet" gets asked, so the trace must survive the guard.
+  if (!espnowStarted) return;
   if (WiFi.scanComplete() == WIFI_SCAN_RUNNING) return;
   uint8_t apCh = (uint8_t)WiFi.channel();
   if (apCh == 0 || apCh == espnowChannel) return;
@@ -514,15 +510,21 @@ void loop() {
     if (now - hb >= 2000) { hb=now; DEBUG1_VALUE("hb ", n++); DEBUG1_VALUE(" ms=", now);
       DEBUG1_VALUE(" wifi=", (int)WiFi.status()); DEBUG1_VALUELN(" ch=", (int)WiFi.channel()); } }
 #endif
-  // Before anything radio-dependent: start ESP-NOW if the association has landed, then follow the
-  // channel if we have associated (or roamed) onto a different one. Cheap — the follow check is
-  // gated to once per ROUTER_CHANNEL_CHECK_MS.
-  startEspNowWhenReady(now);
+  // Before anything radio-dependent: if we have associated (or roamed) onto a different channel,
+  // follow it. Cheap — gated to once per ROUTER_CHANNEL_CHECK_MS.
+  startEspNowWhenReady();
   reconcileEspNowChannel(now);
 #ifdef WLED_COORDINATOR_ROLE
   coordinatorLoop(now);
 #endif
   httpServer.handleClient();   // service the HTTP endpoints (/update, /info, /routes, /debug)
+
+  // Nothing below may touch the radio until begin() has run. quickEspNow is a global with no
+  // constructor, so tx_queue is a null QueueHandle_t until initComms() creates it inside begin();
+  // send() and readyToSendData() both open with uxQueueMessagesWaiting(tx_queue), which panics
+  // rather than returning an error. HTTP and OTA above stay live, which is what makes a router
+  // waiting on an absent AP still recoverable.
+  if (!espnowStarted) return;
 
   // 1. Drain the RX ring: relay SNAPSHOT frames; feed BEACON frames to the election (never relay
   //    beacons — they are single-hop router-to-router).

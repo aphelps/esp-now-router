@@ -57,3 +57,9 @@ String attachMembersJson();
 
 // How many nodes are attached to us — also the load term we advertise.
 uint8_t attachMemberCount();
+
+// ESP-NOW send failures on the attach/advert path, and the last non-zero rc (QuickEspNow
+// comms_send_error_t; -3 = queue full, which is what a wrong-channel radio produces). Always
+// compiled: a silent total-failure mode is the thing these exist to expose.
+uint32_t attachSendFails();
+int      attachLastSendRc();
