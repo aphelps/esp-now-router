@@ -335,6 +335,12 @@ void setup() {
     j += ",\"sweepAt\":" + String(c.sweepAt);
     j += ",\"sweepFoundNow\":" + String(c.sweepFoundNow);
     j += ",\"retryHits\":" + String(c.retryHits);
+    // Policy state. A refused or failed hop without attribution is undiagnosable from outside the
+    // device -- this is the gap a bench session hit when it logged 7 hops and 7 failures.
+    j += ",\"mode\":\"" + String(c.mode == 1 ? "operate" : "onboard") + "\"";
+    j += ",\"lastRefusal\":" + String(c.lastRefusal);
+    j += ",\"blacklisted\":" + String(c.blacklisted);
+    j += ",\"blacklistFull\":" + String(c.blacklistFull ? "true" : "false");
     j += "}";
     httpServer.send(200, "application/json", j);
   });
