@@ -64,6 +64,8 @@ static uint8_t  espnowChannel    = ROUTER_ESPNOW_CHANNEL;  // what the radio is 
 static bool     espnowStarted    = false;  // quickEspNow.begin() has run; see startEspNowWhenReady
 static uint32_t lastChannelChkMs = 0;
 static uint32_t channelFollows   = 0;                      // times we have had to follow the AP
+static uint8_t  apChannelSeen    = 0;   // AP channel last observed (may differ from espnowChannel)
+static uint32_t channelDesyncs   = 0;   // times the STA roamed off the ESP-NOW channel unfixably
 static bool     followWifiChannel = false;                 // true when infra WiFi owns the channel
 
 // Lifetime counters, surfaced by /debug.
@@ -266,6 +268,8 @@ static void handleDebug() {
   j += "\"espnowChannel\":" + String(espnowChannel) + ",";
   j += "\"channelFollows\":" + String(channelFollows) + ",";
   j += "\"espnowStarted\":" + String(espnowStarted ? 1 : 0) + ",";
+  j += "\"apChannelSeen\":" + String(apChannelSeen) + ",";
+  j += "\"channelDesyncs\":" + String(channelDesyncs) + ",";
   j += "\"espnowSendFails\":" + String(attachSendFails()) + ",";
   j += "\"espnowLastSendRc\":" + String(attachLastSendRc()) + ",";
   j += "\"staWifiUp\":" + String(otaWifiUp() ? "true" : "false");
@@ -480,17 +484,25 @@ static void reconcileEspNowChannel(uint32_t now) {
   // Two different situations, and calling setChannel() in the wrong one is itself a bug (it fails
   // every time and retries forever, which is what the first cut of this did):
   //
-  //   infra mode  — the AP owns the channel and the radio is already on it, because we asked
-  //                 QuickEspNow for CURRENT_WIFI_CHANNEL. There is nothing to set; we only record
-  //                 what the channel turned out to be so /info can report it. Trying to set it
-  //                 while associated fails by design.
-  //   standalone  — no infra creds, so WE own the channel. Only here is setChannel() meaningful,
-  //                 and only if something has moved us off it.
+  //   infra mode  — the AP owned the channel at begin(), and begin(CURRENT_WIFI_CHANNEL) resolved
+  //                 and pinned it then. That is true ONLY at begin() time. If the STA later roams
+  //                 to a different channel we CANNOT follow: setChannel() is refused for the rest
+  //                 of the process because begin(CURRENT_WIFI_CHANNEL) set QuickEspNow's own
+  //                 `followWiFiChannel` (QuickEspNow_esp32.cpp:42, checked at :68), and the library
+  //                 has no WiFi event hook — the flag's name promises tracking it does not do.
+  //                 So this is a REAL, UNFIXED gap: after a roam the radio stays on the old
+  //                 channel and every send fails, exactly like the boot-order bug this file's
+  //                 setup() comment describes. See the PR discussion.
+  //   standalone  — no infra creds, so WE own the channel. setChannel() works here.
   if (followWifiChannel) {
-    DEBUG1_VALUE("espnow: on AP channel ", apCh);
-    DEBUG1_VALUELN(" (was ", espnowChannel);
-    espnowChannel = apCh;
-    channelFollows++;
+    // Do NOT overwrite espnowChannel: it records where the RADIO is, and we have not moved it.
+    // The previous shape assigned apCh here and counted a "follow", which made /info report a
+    // channel ESP-NOW was not on — a silent lie in exactly the failure this PR exists to expose.
+    apChannelSeen = apCh;
+    channelDesyncs++;
+    DEBUG_ERR("espnow: STA roamed off the ESP-NOW channel; cannot re-pin (see /debug)");
+    DEBUG1_VALUE("espnow: radio ch ", espnowChannel);
+    DEBUG1_VALUELN(" but AP ch ", apCh);
     return;
   }
   DEBUG1_VALUE("espnow: re-pinning channel ", apCh);
