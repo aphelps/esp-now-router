@@ -17,6 +17,10 @@ static uint32_t     selfId = 0;
 static AttachedNode members[ROUTER_MAX_MEMBERS];
 static RouteChoice  route = ra_route_init();
 
+// Send-failure telemetry. See sendControl() for why these are not behind ROUTER_CHANNEL_DIAG.
+static uint32_t espnowSendFails  = 0;
+static int      espnowLastSendRc = 0;
+
 // Per-frame-type sequence counters. Each control stream numbers itself independently so a receiver
 // can spot gaps in one without the others perturbing it.
 static uint16_t advertSeq = 0;
@@ -56,7 +60,12 @@ static bool sendControl(uint8_t msgType, uint16_t seq, const void *payload, uint
   memcpy(buf, &h, sizeof(h));
   memcpy(buf + sizeof(h), payload, payloadLen);
 
-  return quickEspNow.send(ATTACH_BCAST_ADDR, buf, sizeof(h) + payloadLen) == 0;
+  // Count failures UNCONDITIONALLY. This bug was invisible for exactly one reason: nothing looked
+  // at the return value. A diag-only log leaves it invisible on every deployed build — i.e. every
+  // build where it matters. Surfaced in /debug so "everything is failing" is one HTTP GET away.
+  const int rc = quickEspNow.send(ATTACH_BCAST_ADDR, buf, sizeof(h) + payloadLen);
+  if (rc != 0) { espnowSendFails++; espnowLastSendRc = rc; }
+  return rc == 0;
 }
 
 // Advertise our distance to the timebase leader plus our current load, so the nodes around us can
@@ -225,3 +234,6 @@ String attachMembersJson() {
 uint8_t attachMemberCount() {
   return ra_member_count(members, ROUTER_MAX_MEMBERS);
 }
+
+uint32_t attachSendFails()  { return espnowSendFails; }
+int      attachLastSendRc() { return espnowLastSendRc; }
