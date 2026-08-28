@@ -56,7 +56,11 @@ static bool sendControl(uint8_t msgType, uint16_t seq, const void *payload, uint
   memcpy(buf, &h, sizeof(h));
   memcpy(buf + sizeof(h), payload, payloadLen);
 
-  return quickEspNow.send(ATTACH_BCAST_ADDR, buf, sizeof(h) + payloadLen) == 0;
+  int _rc = quickEspNow.send(ATTACH_BCAST_ADDR, buf, sizeof(h) + payloadLen);
+#ifdef ROUTER_CHANNEL_DIAG
+  if (_rc != 0) { DEBUG1_VALUE("attach: send rc=", _rc); DEBUG1_VALUELN(" len=", (int)(sizeof(h) + payloadLen)); }
+#endif
+  return _rc == 0;
 }
 
 // Advertise our distance to the timebase leader plus our current load, so the nodes around us can

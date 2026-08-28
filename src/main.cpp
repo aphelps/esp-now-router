@@ -60,6 +60,12 @@ static WebServer httpServer(80);   // top-level HTTP server; ota.cpp registers /
 // Live ESP-NOW channel state. Declared here because /info reports it — the whole point of the fix
 // below is that the LIVE channel and the build-time default can differ.
 static uint8_t  espnowChannel    = ROUTER_ESPNOW_CHANNEL;  // what the radio is actually on
+static bool     espnowStarted    = false;  // quickEspNow.begin() has run (see startEspNowWhenReady)
+#ifndef ROUTER_ESPNOW_JOIN_GRACE_MS
+// How long to wait for the STA to associate before starting ESP-NOW anyway. Bounded so a router
+// whose AP is absent still forms a standalone mesh instead of staying mute forever.
+#define ROUTER_ESPNOW_JOIN_GRACE_MS 20000
+#endif
 static uint32_t lastChannelChkMs = 0;
 static uint32_t channelFollows   = 0;                      // times we have had to follow the AP
 static bool     followWifiChannel = false;                 // true when infra WiFi owns the channel
@@ -304,11 +310,26 @@ void setup() {
   // channel to WiFi", which is the same rule WLED's own ESP-NOW follows once joined, so edges and
   // routers converge without coordination. ROUTER_ESPNOW_CHANNEL keeps its meaning for the no-infra
   // case (SoftAP / standalone mesh), where nothing else defines a channel.
+  //
+  // ORDER MATTERS, and getting it wrong is silent. begin(CURRENT_WIFI_CHANNEL) does NOT mean
+  // "track the STA": QuickEspNow resolves it ONCE via esp_wifi_get_channel() and then PINS it with
+  // setChannel() (QuickEspNow_esp32.cpp:37-44). Called here — before otaWifiBegin() has associated
+  // — it pins the BOOT channel. The STA then joins the AP on a different one, the ESP-NOW TX
+  // confirm callback stops arriving, and every send returns -3 (COMMS_SEND_QUEUE_FULL_ERROR) once
+  // the queue backs up. Measured on the bench 2026-08-27 against Lightbringer (AP on ch 2, router
+  // pinned to ch 1): 100% of adverts failed, continuously, while the beacon path — which never
+  // checks its return value — hid it. Re-pinning later does not work either: setChannel() fails
+  // while associated, exactly as reconcileEspNowChannel() documents (verified: "follow setChannel
+  // failed", 172/172 adverts still lost). So the only fix is to start ESP-NOW AFTER association.
   const bool haveInfraCreds = otaHaveInfraCreds();
-  quickEspNow.begin(haveInfraCreds ? CURRENT_WIFI_CHANNEL : ROUTER_ESPNOW_CHANNEL,
-                    0, /*synchronousSend=*/false);
   followWifiChannel = haveInfraCreds;
   espnowChannel     = haveInfraCreds ? 0 : ROUTER_ESPNOW_CHANNEL;   // 0 = "not known yet"
+  if (!haveInfraCreds) {
+    // Standalone: nothing else owns the channel, so start immediately.
+    quickEspNow.begin(ROUTER_ESPNOW_CHANNEL, 0, /*synchronousSend=*/false);
+    espnowStarted = true;
+  }
+  // Infra: deferred to startEspNowWhenReady() in loop(), so boot stays non-blocking.
 
   // Top-level web server: WiFi bring-up (ota), then register all routes here and start it.
   otaWifiBegin();
@@ -401,6 +422,20 @@ void setup() {
 
 static uint32_t lastBeaconMs = 0;
 
+// Start ESP-NOW once the STA has associated, so begin(CURRENT_WIFI_CHANNEL) resolves and pins the
+// AP's channel rather than the boot channel. Non-blocking: loop() keeps serving HTTP meanwhile.
+static void startEspNowWhenReady(uint32_t now) {
+  if (espnowStarted) return;
+  const bool connected = (WiFi.status() == WL_CONNECTED);
+  if (!connected && now < ROUTER_ESPNOW_JOIN_GRACE_MS) return;   // still waiting; keep trying
+  quickEspNow.begin(connected ? CURRENT_WIFI_CHANNEL : ROUTER_ESPNOW_CHANNEL,
+                    0, /*synchronousSend=*/false);
+  espnowChannel = connected ? (uint8_t)WiFi.channel() : ROUTER_ESPNOW_CHANNEL;
+  espnowStarted = true;
+  DEBUG1_VALUE("espnow: started, associated=", (int)connected);
+  DEBUG1_VALUELN(" channel=", (int)espnowChannel);
+}
+
 // --- ESP-NOW channel must FOLLOW the WiFi association -------------------------------------------
 //
 // One radio cannot hold two channels. `quickEspNow.begin(ROUTER_ESPNOW_CHANNEL)` runs in setup(),
@@ -419,6 +454,7 @@ static uint32_t lastBeaconMs = 0;
 // Note this makes the mesh channel a property of the AP, which is the same rule WLED's own ESP-NOW
 // follows once joined — so edges and routers converge on one channel without coordination.
 static void reconcileEspNowChannel(uint32_t now) {
+  if (!espnowStarted) return;   // nothing to reconcile until the radio is up
   if (now - lastChannelChkMs < ROUTER_CHANNEL_CHECK_MS) return;
   lastChannelChkMs = now;
 #ifdef ROUTER_CHANNEL_DIAG
@@ -478,8 +514,10 @@ void loop() {
     if (now - hb >= 2000) { hb=now; DEBUG1_VALUE("hb ", n++); DEBUG1_VALUE(" ms=", now);
       DEBUG1_VALUE(" wifi=", (int)WiFi.status()); DEBUG1_VALUELN(" ch=", (int)WiFi.channel()); } }
 #endif
-  // Before anything radio-dependent: if we have associated (or roamed) onto a different channel,
-  // follow it. Cheap — gated to once per ROUTER_CHANNEL_CHECK_MS.
+  // Before anything radio-dependent: start ESP-NOW if the association has landed, then follow the
+  // channel if we have associated (or roamed) onto a different one. Cheap — the follow check is
+  // gated to once per ROUTER_CHANNEL_CHECK_MS.
+  startEspNowWhenReady(now);
   reconcileEspNowChannel(now);
 #ifdef WLED_COORDINATOR_ROLE
   coordinatorLoop(now);
